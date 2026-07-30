@@ -73,6 +73,19 @@ input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;bac
   border:3px solid var(--bg);box-shadow:0 0 0 1px var(--sig);cursor:pointer}
 input[type=range]:focus-visible{outline:2px solid var(--model);outline-offset:4px}
 .betval{font-family:var(--disp);font-weight:700;font-size:17px;color:var(--sig);min-width:56px;text-align:right}
+.betval.pending{color:var(--warn)}
+input[type=range].pending::-webkit-slider-thumb{background:var(--warn);box-shadow:0 0 0 1px var(--warn)}
+input[type=range].pending::-moz-range-thumb{background:var(--warn);box-shadow:0 0 0 1px var(--warn)}
+
+/* staged commit: the slider proposes, this row decides */
+.stage{display:none;align-items:center;gap:9px;margin-top:8px;padding:8px 10px;
+  border:1px solid #4A3A14;background:#12100A;border-radius:3px;flex-wrap:wrap}
+.stage.on{display:flex}
+.stage .msg{flex:1;min-width:150px;font-size:10px;color:var(--warn);line-height:1.5}
+.stage .msg b{color:var(--ink);font-weight:500}
+.stage .msg i{font-style:normal;color:var(--dim)}
+button.ok{color:var(--bg);background:var(--sig);border-color:var(--sig);font-weight:600}
+button.ok:hover{color:var(--bg);background:#2BFFB8;border-color:#2BFFB8}
 button{font-family:var(--mono);font-size:10px;letter-spacing:.12em;padding:6px 11px;border-radius:2px;
   background:transparent;color:var(--dim);border:1px solid var(--rule);cursor:pointer;text-transform:uppercase}
 button:hover{color:var(--ink);border-color:var(--dimmer)}
@@ -219,6 +232,11 @@ canvas.eq{width:100%;height:130px;display:block}
     </div>
     <button id="pauseBtn">Pause</button>
   </div>
+  <div class="stage" id="betStage" role="status">
+    <div class="msg" id="betMsg"></div>
+    <button id="betOk" class="ok">Apply</button>
+    <button id="betNo">Cancel</button>
+  </div>
 </header>
 
 <div class="wrap">
@@ -287,12 +305,54 @@ const price = (p,a) => p==null?'—':'$'+p.toLocaleString(undefined,{
 
 let S = null, open = new Set(), dragging = false;
 
-$('bet').addEventListener('input', e => { dragging=true; $('betVal').textContent='$'+e.target.value; });
-$('bet').addEventListener('change', async e => {
-  await fetch('/api/bet',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({usd:Number(e.target.value)})});
-  dragging=false;
+/* The slider never touches the engine directly. It stages a value; the Apply
+   button commits it. An accidental drag becomes a cancellable proposal instead
+   of a live position-size change, and you see the total exposure first. */
+let pendingBet = null;
+
+function showStage(){
+  const live = S ? S.bet.usd : null;
+  const slots = S ? S.slots.value : 1;
+  if (pendingBet == null || pendingBet === live){ clearStage(); return; }
+  dragging = true;
+  $('bet').classList.add('pending');
+  $('betVal').classList.add('pending');
+  $('betVal').textContent = '$'+pendingBet;
+  const maxRisk = pendingBet * slots;
+  const dir = pendingBet > live ? 'up' : 'down';
+  $('betMsg').innerHTML = `Change stake <b>$${live} → $${pendingBet}</b> `
+    + `<i>(${dir})</i> · at ${slots} slot${slots>1?'s':''} that is `
+    + `<b>$${maxRisk}</b> committed at once. Not applied yet.`;
+  $('betOk').textContent = `Apply $${pendingBet}`;
+  $('betStage').classList.add('on');
+}
+
+function clearStage(){
+  pendingBet = null; dragging = false;
+  $('bet').classList.remove('pending');
+  $('betVal').classList.remove('pending');
+  $('betStage').classList.remove('on');
+  if (S){ $('bet').value = S.bet.usd; $('betVal').textContent = '$'+S.bet.usd; }
+}
+
+$('bet').addEventListener('input', e => { pendingBet = Number(e.target.value); showStage(); });
+$('betNo').addEventListener('click', clearStage);
+$('betOk').addEventListener('click', async () => {
+  const v = pendingBet;
+  if (v == null) return;
+  $('betOk').disabled = true;
+  try {
+    await fetch('/api/bet',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({usd:v})});
+  } finally {
+    $('betOk').disabled = false;
+    pendingBet = null; dragging = false;
+    $('bet').classList.remove('pending');
+    $('betVal').classList.remove('pending');
+    $('betStage').classList.remove('on');
+  }
 });
+document.addEventListener('keydown', e => { if(e.key==='Escape' && pendingBet!=null) clearStage(); });
 async function setSlots(n){
   await fetch('/api/slots',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({slots:n})});
@@ -351,6 +411,7 @@ function render(s){
   if(!dragging){ $('bet').value=s.bet.usd; $('betVal').textContent='$'+s.bet.usd; }
   $('bet').min=s.bet.min; $('bet').max=s.bet.max;
   renderSlots(s);
+  if (pendingBet != null) showStage();
   $('pauseBtn').textContent = s.paused?'Resume':'Pause';
   $('pauseBtn').className = s.paused?'hot':'';
 
