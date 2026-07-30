@@ -15,7 +15,7 @@ function __req(name) {
   return m.exports;
 }
 
-// ═══ module: config ═══════════════════════
+// ═══ module: config ══════════════════════
 __def('config', (module, exports) => {
   const num = (v, d) => (v === undefined || v === '' || isNaN(Number(v)) ? d : Number(v));
   const bool = (v, d) => (v === undefined || v === '' ? d : String(v).toLowerCase() === 'true');
@@ -143,13 +143,32 @@ __def('config', (module, exports) => {
     // A resting quote needs TIME to get hit. 25s in a market that trades a few
     // times a minute means cancelling before anyone could ever take it.
     ORDER_TTL_S: num(process.env.ORDER_TTL_S, 240),
+
+    // Posting gets you whatever crosses your price, which was producing positions
+    // anywhere from $0.14 to $10 against a $10 target. Anything filling below this
+    // fraction of the intended size is cancelled and NOT opened — a 2% fill is
+    // noise in the ledger, not a trade.
+    MIN_FILL_FRACTION: num(process.env.MIN_FILL_FRACTION, 0.5),
+
+    // Keep our own view of settled cash in sync with the exchange's.
+    BALANCE_REFRESH_S: num(process.env.BALANCE_REFRESH_S, 30),
+    BALANCE_BUFFER_USD: num(process.env.BALANCE_BUFFER_USD, 5),
     ORDER_FAIL_COOLDOWN_S: num(process.env.ORDER_FAIL_COOLDOWN_S, 60),
     PAUSE_COOLDOWN_S: num(process.env.PAUSE_COOLDOWN_S, 90),
     FEE_RATE: num(process.env.FEE_RATE, 0.07),               // Kalshi: ceil(rate*C*P*(1-P))
     SLIPPAGE_CENTS: num(process.env.SLIPPAGE_CENTS, 0.5),
 
     // ---------- exits ----------
-    TAKE_PROFIT_CENTS: num(process.env.TAKE_PROFIT_CENTS, 14),
+    // Percentage-of-cost exits. A position bought at `entry` exits when the bid
+    // reaches entry*(1+TP) or falls to entry*(1-SL).
+    //
+    // NOTE the arithmetic ceiling on take-profit: a contract can never trade above
+    // 100c, so +65% is only reachable from an entry below 60.6c. Above that the
+    // TP can never trigger and the position rides to settlement — which is the
+    // correct outcome anyway, since settlement costs no fee.
+    TAKE_PROFIT_PCT: num(process.env.TAKE_PROFIT_PCT, 0.65),
+    STOP_LOSS_PCT: num(process.env.STOP_LOSS_PCT, 0.50),
+    TAKE_PROFIT_CENTS: num(process.env.TAKE_PROFIT_CENTS, 99),
     STOP_EDGE_CENTS: num(process.env.STOP_EDGE_CENTS, -6),   // exit if edge inverts this far
     HOLD_TO_SETTLE_Z: num(process.env.HOLD_TO_SETTLE_Z, 1.6),// deep ITM: ride it out
     FLATTEN_BEFORE_CLOSE_S: num(process.env.FLATTEN_BEFORE_CLOSE_S, 0), // 0 = never
@@ -182,7 +201,7 @@ __def('config', (module, exports) => {
   module.exports = CFG;
 });
 
-// ═══ module: log ═══════════════════════
+// ═══ module: log ══════════════════════
 __def('log', (module, exports) => {
   const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
   const min = LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] || 20;
@@ -210,7 +229,7 @@ __def('log', (module, exports) => {
   };
 });
 
-// ═══ module: store ═══════════════════════
+// ═══ module: store ══════════════════════
 __def('store', (module, exports) => {
   const CFG = __req('config');
 
@@ -327,7 +346,7 @@ __def('store', (module, exports) => {
   module.exports = store;
 });
 
-// ═══ module: kalshi ═══════════════════════
+// ═══ module: kalshi ══════════════════════
 __def('kalshi', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -505,7 +524,7 @@ __def('kalshi', (module, exports) => {
   module.exports = kalshi;
 });
 
-// ═══ module: pricing ═══════════════════════
+// ═══ module: pricing ══════════════════════
 __def('pricing', (module, exports) => {
   const CFG = __req('config');
 
@@ -651,7 +670,7 @@ __def('pricing', (module, exports) => {
   module.exports = { fairValue, feeCents, Phi, settleVarMultiplier };
 });
 
-// ═══ module: oracle ═══════════════════════
+// ═══ module: oracle ══════════════════════
 __def('oracle', (module, exports) => {
   const WebSocket = require('ws');
   const CFG = __req('config');
@@ -984,7 +1003,7 @@ __def('oracle', (module, exports) => {
   };
 });
 
-// ═══ module: portfolio ═══════════════════════
+// ═══ module: portfolio ══════════════════════
 __def('portfolio', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -1046,7 +1065,9 @@ __def('portfolio', (module, exports) => {
       series: entry.series,
       side: entry.side,                 // 'yes' | 'no'
       contracts: entry.contracts,
-      entryPrice: entry.price,          // cents
+      orderedContracts: entry.orderedContracts ?? entry.contracts,
+      fillFraction: entry.fillFraction ?? 1,
+      entryPrice: Math.round(entry.price * 100) / 100,          // cents
       costUsd: (entry.contracts * entry.price) / 100,
       feeUsd: entry.feeUsd,
       openedAt: Date.now(),
@@ -1072,7 +1093,9 @@ __def('portfolio', (module, exports) => {
     P.day.trades += 1;
     await store.hset('positions', pos.ticker, pos);
     await persistState();
-    log.info(`OPEN ${pos.asset} [${pos.freqLabel}] ${pos.ticker} ${pos.side.toUpperCase()} x${pos.contracts} @ ${pos.entryPrice}¢ (edge ${pos.edgeCents.toFixed(1)}¢)`);
+    log.info(`OPEN ${pos.asset} [${pos.freqLabel}] ${pos.ticker} ${pos.side.toUpperCase()} `
+      + `x${pos.contracts}/${pos.orderedContracts} @ ${pos.entryPrice.toFixed(1)}¢ `
+      + `= $${pos.costUsd.toFixed(2)} (edge ${pos.edgeCents.toFixed(1)}¢)`);
     return pos;
   }
 
@@ -1176,7 +1199,15 @@ __def('portfolio', (module, exports) => {
       actual: c.n ? (c.actual / c.n) * 100 : 0,
     })).sort((x, y) => parseInt(x.bucket) - parseInt(y.bucket));
 
+    const fillFracs = settled.map(t => t.fillFraction ?? 1);
+    const stakes = settled.map(t => t.costUsd);
     return {
+      fillQuality: {
+        avgFillPct: fillFracs.length ? fillFracs.reduce((a, b) => a + b, 0) / fillFracs.length * 100 : 100,
+        minStake: stakes.length ? Math.min(...stakes) : 0,
+        maxStake: stakes.length ? Math.max(...stakes) : 0,
+        medianStake: stakes.length ? [...stakes].sort((a, b) => a - b)[Math.floor(stakes.length / 2)] : 0,
+      },
       bankroll: P.bankroll,
       deployed: deployed(),
       unrealized: unrealized(),
@@ -1203,7 +1234,7 @@ __def('portfolio', (module, exports) => {
   };
 });
 
-// ═══ module: strategy ═══════════════════════
+// ═══ module: strategy ══════════════════════
 __def('strategy', (module, exports) => {
   const CFG = __req('config');
   const { fairValue, feeCents } = __req('pricing');
@@ -1506,7 +1537,7 @@ __def('strategy', (module, exports) => {
   module.exports = { evaluate, readBook, contractsFor, sizeUsd, FREQ };
 });
 
-// ═══ module: engine ═══════════════════════
+// ═══ module: engine ══════════════════════
 __def('engine', (module, exports) => {
   const CFG = __req('config');
   const log = __req('log');
@@ -1576,6 +1607,8 @@ __def('engine', (module, exports) => {
   const runtime = {
     betUsd: CFG.BET_USD,
     slots: Math.max(CFG.SLOTS_MIN, Math.min(CFG.SLOTS_MAX, CFG.SLOTS)),
+    balanceUsd: null,
+    balanceAt: 0,
     drops: {},
     dropTotal: 0,
     rawSamples: {},
@@ -1764,6 +1797,18 @@ __def('engine', (module, exports) => {
     const until = orderCooldown.get(m.ticker);
     if (until && Date.now() < until) return null;
     const c = decision.candidate;
+
+    // Don't send orders the account can't fund — that was the insufficient_balance
+    // storm. Our internal bankroll is not the exchange's view of settled cash.
+    const cost = (c.contracts * c.price) / 100;
+    const avail = runtime.balanceUsd;
+    if (avail != null && cost > avail - CFG.BALANCE_BUFFER_USD) {
+      if (!runtime.balanceWarnedAt || Date.now() - runtime.balanceWarnedAt > 120000) {
+        runtime.balanceWarnedAt = Date.now();
+        log.warn(`balance $${avail.toFixed(2)} won't cover $${cost.toFixed(2)} + $${CFG.BALANCE_BUFFER_USD} buffer — holding off`);
+      }
+      return null;
+    }
     const feeUsd = feeCents(c.contracts, c.price / 100) / 100;
 
     const base = {
@@ -1819,12 +1864,20 @@ __def('engine', (module, exports) => {
       const orderId = order.order_id;
 
       if (filled > 0) {
+        const frac = filled / c.contracts;
+        if (frac < CFG.MIN_FILL_FRACTION) {
+          // Too small to be a real position. Unwind rather than book noise.
+          if (orderId) await kalshi.cancelOrder(orderId).catch(() => {});
+          log.info(`FILL too small ${m.ticker} ${filled}/${c.contracts} (${(frac * 100).toFixed(0)}%) — discarded`);
+          return null;
+        }
         const px = order.average_fill_price != null
           ? avgFillToSideCents(c.side, order.average_fill_price)
           : limit;
         await pf.open({ ...base, contracts: filled, price: px, orderId, paper: false,
-          feeUsd: Number(order.average_fee_paid || 0) * filled });
-        log.info(`FILL ${m.ticker} ${c.side} x${filled} @ ${px.toFixed(1)}¢ (id ${orderId})`);
+          feeUsd: Number(order.average_fee_paid || 0) * filled,
+          orderedContracts: c.contracts, fillFraction: frac });
+        log.info(`FILL ${m.ticker} ${c.side} x${filled}/${c.contracts} @ ${px.toFixed(1)}¢`);
       } else if (orderId) {
         runtime.pending.set(m.ticker, { orderId, placedAt: Date.now(), base, limit });
         log.info(`ORDER ${m.ticker} ${c.side} x${c.contracts} @ ${limit}¢ resting (id ${orderId})`);
@@ -1856,7 +1909,8 @@ __def('engine', (module, exports) => {
   /** V2 reports the YES-leg fill price; convert back to the side we traded. */
   function avgFillToSideCents(side, avgDollars) {
     const yesCents = Number(avgDollars) * 100;
-    return side === 'yes' ? yesCents : 100 - yesCents;
+    const c = side === 'yes' ? yesCents : 100 - yesCents;
+    return Math.round(c * 100) / 100;   // kill 64.99999999999999
   }
 
   async function reconcilePending() {
@@ -1866,8 +1920,15 @@ __def('engine', (module, exports) => {
         // from the fills feed instead — it carries our order_id and real prices.
         const res = await kalshi.fills(p.base.ticker, 50);
         const mine = (res.fills || []).filter(f => f.order_id === p.orderId);
+        if (mine.length && !runtime.rawFill) runtime.rawFill = mine[0];
         const filled = mine.reduce((a, f) => a + Number(f.count ?? f.count_fp ?? 0), 0);
-        if (filled > 0) {
+        const frac = filled / (p.base.contracts || 1);
+        if (filled > 0 && frac < CFG.MIN_FILL_FRACTION
+            && Date.now() - p.placedAt > CFG.ORDER_TTL_S * 1000) {
+          await kalshi.cancelOrder(p.orderId).catch(() => {});
+          runtime.pending.delete(ticker);
+          log.info(`FILL too small ${ticker} ${filled}/${p.base.contracts} (${(frac * 100).toFixed(0)}%) — discarded`);
+        } else if (filled > 0 && frac >= CFG.MIN_FILL_FRACTION) {
           const notional = mine.reduce((a, f) => {
             const yesC = f.yes_price_dollars != null
               ? Number(f.yes_price_dollars) * 100
@@ -1955,11 +2016,22 @@ __def('engine', (module, exports) => {
       const pSide = fv ? (pos.side === 'yes' ? fv.p : 1 - fv.p) : null;
       const liveEdge = pSide != null ? pSide * 100 - bid : null;
 
+      // Percentage of cost, measured against the price we could sell into now.
+      const pnlPct = (bid - pos.entryPrice) / pos.entryPrice;
+      const tpPrice = pos.entryPrice * (1 + CFG.TAKE_PROFIT_PCT);
+      const slPrice = pos.entryPrice * (1 - CFG.STOP_LOSS_PCT);
+
       let reason = null;
       if (CFG.FLATTEN_BEFORE_CLOSE_S > 0 && tau <= CFG.FLATTEN_BEFORE_CLOSE_S) reason = 'flatten';
+      else if (pnlPct >= CFG.TAKE_PROFIT_PCT) reason = `take profit +${(pnlPct * 100).toFixed(0)}%`;
+      else if (pnlPct <= -CFG.STOP_LOSS_PCT) reason = `stop loss ${(pnlPct * 100).toFixed(0)}%`;
       else if (bid - pos.entryPrice >= CFG.TAKE_PROFIT_CENTS) reason = 'take profit';
       else if (liveEdge != null && liveEdge <= CFG.STOP_EDGE_CENTS
                && !(fv && Math.abs(fv.z) >= CFG.HOLD_TO_SETTLE_Z && pSide > 0.5)) reason = 'edge lost';
+      pos.tpPrice = Math.min(99, Math.round(tpPrice * 10) / 10);
+      pos.slPrice = Math.round(slPrice * 10) / 10;
+      pos.tpReachable = tpPrice <= 99;
+      pos.pnlPct = pnlPct * 100;
 
       if (!reason) continue;
       if (bidSize < 1) continue;
@@ -1985,10 +2057,28 @@ __def('engine', (module, exports) => {
 
   // ------------------------------------------------------------------ main loop
 
+  /** Ask the exchange what we can actually spend, rather than trusting our own ledger. */
+  async function refreshBalance() {
+    if (CFG.PAPER_MODE) { runtime.balanceUsd = pf.P.bankroll; return; }
+    if (Date.now() - runtime.balanceAt < CFG.BALANCE_REFRESH_S * 1000) return;
+    try {
+      const res = await kalshi.balance();
+      const b = res.balance_dollars != null
+        ? Number(res.balance_dollars)
+        : Number(res.balance ?? 0) / 100;
+      if (Number.isFinite(b)) {
+        if (runtime.balanceUsd == null) log.info(`exchange balance: $${b.toFixed(2)}`);
+        runtime.balanceUsd = b;
+        runtime.balanceAt = Date.now();
+      }
+    } catch (e) { log.debug(`balance refresh failed: ${e.message}`); }
+  }
+
   async function tick() {
     if (runtime.paused) return;
     const t0 = Date.now();
     runtime.scans += 1;
+    await refreshBalance();
 
     if (Date.now() - lastDiscovery > 45000) await discover();
 
@@ -2130,7 +2220,7 @@ __def('engine', (module, exports) => {
   module.exports = { start, runtime, setBet, setSlots, tick, discover, rejectSummary };
 });
 
-// ═══ server ═════════════════════
+// ═══ server ════════════════════
 const path = require('path');
 const express = require('express');
 const CFG = __req('config');
@@ -2199,6 +2289,14 @@ app.get('/api/state', (req, res) => {
     rawSamples: engine.runtime.rawSamples,
     discovery: engine.runtime.discovery,
     rawBook: engine.runtime.rawBook,
+    rawFill: engine.runtime.rawFill,
+    balanceUsd: engine.runtime.balanceUsd,
+    exits: {
+      takeProfitPct: CFG.TAKE_PROFIT_PCT * 100,
+      stopLossPct: CFG.STOP_LOSS_PCT * 100,
+      tpReachableBelowCents: Math.floor(10000 / (1 + CFG.TAKE_PROFIT_PCT)) / 100,
+      minFillFraction: CFG.MIN_FILL_FRACTION,
+    },
     calibrationMode: CFG.CALIBRATION_MODE,
     positions: pf.positions(),
     trades: pf.trades(60),
