@@ -40,7 +40,30 @@ header{position:sticky;top:0;z-index:20;background:rgba(6,8,10,.92);
 .equity span{display:block;font-family:var(--mono);font-weight:400;font-size:10px;
   letter-spacing:.12em;color:var(--dim)}
 
-.betbar{display:flex;align-items:center;gap:10px;margin-top:9px;padding-top:9px;border-top:1px solid var(--rule)}
+.betbar{display:flex;align-items:center;gap:10px;margin-top:9px;padding-top:9px;
+  border-top:1px solid var(--rule);flex-wrap:wrap}
+.ctl{display:flex;align-items:center;gap:9px}
+.ctl.grow{flex:1;min-width:170px}
+
+/* slot selector — the cells show capacity, the dots show what's live in them */
+.slots{display:flex;border:1px solid var(--rule);border-radius:3px;overflow:hidden;background:#080C0F}
+.slot{position:relative;width:31px;height:27px;display:grid;place-items:center;
+  font-family:var(--mono);font-size:11px;color:var(--dimmer);background:transparent;
+  border:none;border-right:1px solid var(--rule);cursor:pointer;padding:0;letter-spacing:0;
+  transition:color .16s ease,background .16s ease}
+.slot:last-child{border-right:none}
+.slot:hover{color:var(--dim)}
+.slot.inrange{color:var(--ink);background:#0D1316}
+.slot.edge{color:var(--bg);background:var(--sig);font-weight:600}
+.slot.edge:hover{color:var(--bg)}
+.slot:focus-visible{outline:2px solid var(--model);outline-offset:-2px;z-index:1}
+.slot i{position:absolute;bottom:3.5px;left:50%;transform:translateX(-50%);
+  width:3px;height:3px;border-radius:50%;background:var(--dimmer);transition:background .16s ease}
+.slot.inrange i,.slot.edge i{background:#1E2A2E}
+.slot.filled i{background:var(--sig);box-shadow:0 0 5px var(--sig)}
+.slot.edge.filled i{background:var(--bg);box-shadow:none}
+.slotnote{font-size:9px;color:var(--dim);letter-spacing:.06em;white-space:nowrap;min-width:52px}
+@media(prefers-reduced-motion:reduce){.slot,.slot i{transition:none}}
 .betbar label{font-size:9.5px;letter-spacing:.14em;color:var(--dim);white-space:nowrap}
 input[type=range]{flex:1;-webkit-appearance:none;appearance:none;height:2px;background:var(--rule);
   border-radius:2px;outline:none;min-width:80px}
@@ -89,6 +112,9 @@ button.hot{color:var(--warn);border-color:#4A3A14}
 .mktTop{display:flex;align-items:baseline;gap:7px}
 .mktTop .sym{font-size:12px}
 .strike{color:var(--dim);font-size:11px}
+.freq{font-size:8px;letter-spacing:.1em;padding:1px 4px;border-radius:2px;border:1px solid var(--rule);
+  color:var(--dim);flex-shrink:0}
+.freq.m15{color:var(--model);border-color:#2E2450;background:#0F0B1A}
 .clock{margin-left:auto;font-size:11px;font-variant-numeric:tabular-nums}
 .clock.soon{color:var(--warn)}
 
@@ -166,9 +192,16 @@ canvas.eq{width:100%;height:130px;display:block}
     <div class="equity" id="equity">—<span>EQUITY</span></div>
   </div>
   <div class="betbar">
-    <label for="bet">FLAT BET</label>
-    <input type="range" id="bet" min="10" max="100" step="5" value="25" aria-label="Flat bet size in dollars" />
-    <div class="betval" id="betVal">$25</div>
+    <div class="ctl grow">
+      <label for="bet">FLAT BET</label>
+      <input type="range" id="bet" min="10" max="100" step="5" value="25" aria-label="Flat bet size in dollars" />
+      <div class="betval" id="betVal">$25</div>
+    </div>
+    <div class="ctl">
+      <label>SLOTS</label>
+      <div class="slots" id="slots" role="group" aria-label="Concurrent position slots"></div>
+      <div class="slotnote" id="slotNote">—</div>
+    </div>
     <button id="pauseBtn">Pause</button>
   </div>
 </header>
@@ -199,7 +232,7 @@ canvas.eq{width:100%;height:130px;display:block}
       <canvas class="eq" id="eqChart"></canvas>
     </section>
     <section class="panel">
-      <div class="phead"><h2>By asset</h2><div class="note">W / L / P&amp;L</div></div>
+      <div class="phead"><h2>Splits</h2><div class="note">by clock, then asset</div></div>
       <div class="bars" id="assetBars"></div>
     </section>
     <section class="panel">
@@ -238,6 +271,36 @@ $('bet').addEventListener('change', async e => {
     body:JSON.stringify({usd:Number(e.target.value)})});
   dragging=false;
 });
+async function setSlots(n){
+  await fetch('/api/slots',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({slots:n})});
+}
+
+/* Cells left of the selection are in-capacity; a lit dot means that slot is
+   actually holding a contract right now. Capacity and usage in one control. */
+function renderSlots(s){
+  const {value,min,max,used}=s.slots, box=$('slots');
+  if(box.childElementCount!==max){
+    box.innerHTML='';
+    for(let n=min;n<=max;n++){
+      const b=document.createElement('button');
+      b.className='slot'; b.dataset.n=n; b.type='button';
+      b.setAttribute('aria-label',n+' concurrent '+(n===1?'position':'positions'));
+      b.innerHTML=n+'<i></i>';
+      b.onclick=()=>setSlots(Number(b.dataset.n));
+      box.appendChild(b);
+    }
+  }
+  [...box.children].forEach(b=>{
+    const n=Number(b.dataset.n);
+    b.className='slot'+(n<value?' inrange':'')+(n===value?' edge':'')+(n<=used?' filled':'');
+    b.setAttribute('aria-pressed',n===value);
+  });
+  $('slotNote').innerHTML = used>value
+    ? `<span style="color:var(--warn)">${used} live · draining</span>`
+    : `${used}/${value} filled`;
+}
+
 $('pauseBtn').addEventListener('click', async () => {
   const next = !(S && S.paused);
   await fetch('/api/pause',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -263,6 +326,7 @@ function render(s){
     '<i class="'+cls(st.realized)+'" style="font-style:normal">'+sgn(st.realized)+' REALISED</i></span>';
   if(!dragging){ $('bet').value=s.bet.usd; $('betVal').textContent='$'+s.bet.usd; }
   $('bet').min=s.bet.min; $('bet').max=s.bet.max;
+  renderSlots(s);
   $('pauseBtn').textContent = s.paused?'Resume':'Pause';
   $('pauseBtn').className = s.paused?'hot':'';
 
@@ -335,6 +399,7 @@ function renderBoard(s){
     return `<div class="mkt ${m.fire?'fire':''}">
       <div class="mktTop">
         <div class="sym">${m.asset}</div>
+        <span class="freq ${m.freq==='15M'?'m15':''}">${m.freq||'1H'}</span>
         <div class="strike">${strike}</div>
         <div class="clock ${m.tau<180?'soon':''}">${clock(m.tau)}</div>
       </div>
@@ -422,8 +487,9 @@ function drawDist(cv, m){
 /* ---------- open positions ---------- */
 function renderPositions(s){
   const ps=s.positions||[];
-  $('openNote').textContent = ps.length? ps.length+' position'+(ps.length>1?'s':'')+' · '+
-    money(s.stats.deployed)+' deployed' : 'flat';
+  $('openNote').textContent = ps.length
+    ? ps.length+'/'+s.slots.value+' slots · '+money(s.stats.deployed)+' deployed'
+    : 'flat · '+s.slots.value+' slot'+(s.slots.value>1?'s':'')+' open at '+money(s.bet.usd)+' each';
   if(!ps.length){ $('posTbl').innerHTML=
     '<tr><td class="empty"><b>FLAT</b>No open contracts. The board above is what the engine is watching.</td></tr>';
     return; }
@@ -432,7 +498,8 @@ function renderPositions(s){
     ps.map(p=>{
       const tau=(Date.parse(p.closeTime)-s.now)/1000;
       return `<tr class="row" data-k="p:${esc(p.ticker)}">
-        <td>${p.asset}<div class="mut" style="font-size:9px">${strikeTxt(p)}</div></td>
+        <td>${p.asset} <span class="freq ${p.freqLabel==='15M'?'m15':''}">${p.freqLabel||'1H'}</span>
+          <div class="mut" style="font-size:9px">${strikeTxt(p)}</div></td>
         <td><span class="pill ${p.side}">${p.side.toUpperCase()}</span></td>
         <td>${p.contracts}</td><td>${p.entryPrice}¢</td>
         <td>${p.markPrice}¢</td>
@@ -503,13 +570,20 @@ function renderEquity(st){
 }
 
 function renderAssets(st){
+  const f=Object.entries(st.byFreq||{});
+  const freqRows = f.length ? f.map(([k,v])=>{
+    const tot=v.w+v.l||1;
+    return `<div class="bar"><div><span class="freq ${k==='15M'?'m15':''}">${k}</span></div>
+      <div class="track"><i class="w" style="width:${v.w/tot*100}%"></i><i class="l" style="width:${v.l/tot*100}%"></i></div>
+      <div style="text-align:right" class="${cls(v.pnl)}">${sgn(v.pnl)} <span class="mut">${v.roi.toFixed(0)}%</span></div></div>`;
+  }).join('')+'<div style="height:1px;background:var(--rule);margin:3px 0"></div>' : '';
   const e=Object.entries(st.byAsset||{});
-  $('assetBars').innerHTML = e.length? e.map(([a,v])=>{
+  $('assetBars').innerHTML = freqRows + (e.length? e.map(([a,v])=>{
     const tot=v.w+v.l||1;
     return `<div class="bar"><div>${a}</div>
       <div class="track"><i class="w" style="width:${v.w/tot*100}%"></i><i class="l" style="width:${v.l/tot*100}%"></i></div>
       <div style="text-align:right" class="${cls(v.pnl)}">${sgn(v.pnl)}</div></div>`;
-  }).join('') : '<div class="empty">Splits appear once trades settle.</div>';
+  }).join('') : '<div class="empty">Splits appear once trades settle.</div>');
 }
 
 function renderCalib(st){
@@ -529,7 +603,8 @@ function renderTrades(s){
     '<thead><tr><th>Time</th><th>Mkt</th><th>Side</th><th>In</th><th>Out</th><th>Qty</th><th>P&amp;L</th><th>ROI</th><th>Why</th></tr></thead><tbody>'+
     t.map(x=>`<tr class="row" data-k="t:${esc(x.id)}">
       <td class="mut">${new Date(x.closedAt).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</td>
-      <td>${x.asset}<div class="mut" style="font-size:9px">${strikeTxt(x)}</div></td>
+      <td>${x.asset} <span class="freq ${x.freqLabel==='15M'?'m15':''}">${x.freqLabel||'1H'}</span>
+        <div class="mut" style="font-size:9px">${strikeTxt(x)}</div></td>
       <td><span class="pill ${x.side}">${x.side.toUpperCase()}</span></td>
       <td>${x.entryPrice}¢</td><td>${x.exitPrice}¢</td><td>${x.contracts}</td>
       <td class="${cls(x.pnlUsd)}">${sgn(x.pnlUsd)}</td>
