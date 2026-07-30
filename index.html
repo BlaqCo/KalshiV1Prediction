@@ -499,7 +499,7 @@ function renderBoard(s){
       </div>
       <div class="kv">
         <div><span>SIDE</span><b class="${c?(c.side==='yes'?'up':''):'mut'}">${c?c.side.toUpperCase():'—'}</b></div>
-        <div><span>${c?(c.entry==='cross'?'LIFT ASK':'POST AT'):'PRICE'}</span><b>${c?c.price+'¢':'—'}</b></div>
+        <div><span>${c?(c.entry==='cross'?'LIFT ASK':c.entry==='quote'?'QUOTE AT':'POST AT'):'PRICE'}</span><b class="${c&&c.entry==='quote'?'':''}" style="${c&&c.entry==='quote'?'color:var(--warn)':''}">${c?c.price+'¢':'—'}</b></div>
         <div><span>FAIR</span><b style="color:var(--model)">${mdl!=null?(mdl*100).toFixed(1)+'¢':'—'}</b></div>
         <div><span>NET EDGE</span><b class="${edge>0?'up':edge<0?'down':'mut'}">${edge!=null?edge.toFixed(1)+'¢':'—'}</b></div>
         <div><span>Z</span><b>${fv?fv.z.toFixed(2):'—'}</b></div>
