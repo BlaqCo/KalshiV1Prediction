@@ -15,7 +15,7 @@ function __req(name) {
   return m.exports;
 }
 
-// ═══ module: config ════════════════════════
+// ═══ module: config ══════════════════════
 __def('config', (module, exports) => {
   const num = (v, d) => (v === undefined || v === '' || isNaN(Number(v)) ? d : Number(v));
   const bool = (v, d) => (v === undefined || v === '' ? d : String(v).toLowerCase() === 'true');
@@ -88,6 +88,17 @@ __def('config', (module, exports) => {
     MAX_SPREAD_CENTS: num(process.env.MAX_SPREAD_CENTS, 4),
     MIN_BOOK_DEPTH: num(process.env.MIN_BOOK_DEPTH, 25),     // contracts at touch
     MIN_EDGE_CENTS: num(process.env.MIN_EDGE_CENTS, 4.0),    // net of fees + slippage
+
+    // ENTRY_MODE 'edge'        — fire on edge size, ignore the probability level
+    // ENTRY_MODE 'probability' — fire whenever the model is at least MIN_PROB_PCT
+    //                            confident. Execution is still governed by
+    //                            ORDER_STYLE, so `limit_touch` posts passively and
+    //                            never pays the spread.
+    // Either way we refuse to pay MORE than the outcome is worth: a 60% chance
+    // bought at 75c loses 15c per contract in expectation every time.
+    ENTRY_MODE: str(process.env.ENTRY_MODE, 'edge'),
+    MIN_PROB_PCT: num(process.env.MIN_PROB_PCT, 60),
+    MIN_EDGE_PROB_MODE: num(process.env.MIN_EDGE_PROB_MODE, 0.5),
     MAX_ABS_Z: num(process.env.MAX_ABS_Z, 2.2),              // moneyness band
     MIN_ABS_Z: num(process.env.MIN_ABS_Z, 0.0),
     MIN_PRICE_CENTS: num(process.env.MIN_PRICE_CENTS, 8),
@@ -167,7 +178,7 @@ __def('config', (module, exports) => {
   module.exports = CFG;
 });
 
-// ═══ module: log ════════════════════════
+// ═══ module: log ══════════════════════
 __def('log', (module, exports) => {
   const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
   const min = LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] || 20;
@@ -195,7 +206,7 @@ __def('log', (module, exports) => {
   };
 });
 
-// ═══ module: store ════════════════════════
+// ═══ module: store ══════════════════════
 __def('store', (module, exports) => {
   const CFG = __req('config');
 
@@ -312,7 +323,7 @@ __def('store', (module, exports) => {
   module.exports = store;
 });
 
-// ═══ module: kalshi ════════════════════════
+// ═══ module: kalshi ══════════════════════
 __def('kalshi', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -482,7 +493,7 @@ __def('kalshi', (module, exports) => {
   module.exports = kalshi;
 });
 
-// ═══ module: pricing ════════════════════════
+// ═══ module: pricing ══════════════════════
 __def('pricing', (module, exports) => {
   const CFG = __req('config');
 
@@ -628,7 +639,7 @@ __def('pricing', (module, exports) => {
   module.exports = { fairValue, feeCents, Phi, settleVarMultiplier };
 });
 
-// ═══ module: oracle ════════════════════════
+// ═══ module: oracle ══════════════════════
 __def('oracle', (module, exports) => {
   const WebSocket = require('ws');
   const CFG = __req('config');
@@ -961,7 +972,7 @@ __def('oracle', (module, exports) => {
   };
 });
 
-// ═══ module: portfolio ════════════════════════
+// ═══ module: portfolio ══════════════════════
 __def('portfolio', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -1180,7 +1191,7 @@ __def('portfolio', (module, exports) => {
   };
 });
 
-// ═══ module: strategy ════════════════════════
+// ═══ module: strategy ══════════════════════
 __def('strategy', (module, exports) => {
   const CFG = __req('config');
   const { fairValue, feeCents } = __req('pricing');
@@ -1194,6 +1205,7 @@ __def('strategy', (module, exports) => {
 
   /** Per-frequency tuning. The model is identical; only the clock changes. */
   const CAL = CFG.CALIBRATION_MODE;
+  const PROB_MODE = CFG.ENTRY_MODE === 'probability';
   const FREQ = {
     hourly: {
       key: 'hourly', label: '1H',
@@ -1219,39 +1231,54 @@ __def('strategy', (module, exports) => {
    * cents + contracts rather than assuming one shape — a silently unparsed book
    * looks exactly like an empty book.
    */
-  function levelToCents(v) {
-    if (v == null) return null;
-    if (typeof v === 'number') return v > 1 ? v : v * 100;   // cents, or dollars <=1
-    const n = Number(v);
-    if (!Number.isFinite(n)) return null;
-    // a decimal point means dollars; a bare integer means cents
-    return String(v).includes('.') ? n * 100 : n;
+  const rawPrice = l => Array.isArray(l)
+    ? (l.length >= 2 ? l[0] : null)
+    : (l && typeof l === 'object'
+        ? (l.price_dollars ?? l.price ?? l.yes_price_dollars ?? l.yes_price)
+        : null);
+  const rawSize = l => Array.isArray(l)
+    ? (l.length >= 2 ? l[1] : null)
+    : (l && typeof l === 'object' ? (l.size_fp ?? l.size ?? l.count_fp ?? l.count) : null);
+
+  /**
+   * Decide cents-vs-dollars ONCE for the whole book, never per level. Per-value
+   * guessing is ambiguous at exactly 1 — integer 1 is both "1 cent" and "$1.00" —
+   * and reading a 1c bid as 100c inverts the book and manufactures a fake edge.
+   * A decimal point or a fractional number anywhere proves the book is in dollars;
+   * otherwise it is integer cents.
+   */
+  function detectDollars(levels) {
+    for (const l of levels) {
+      const p = rawPrice(l);
+      if (p == null) continue;
+      if (typeof p === 'string' && p.includes('.')) return true;
+      const n = Number(p);
+      if (Number.isFinite(n) && !Number.isInteger(n)) return true;
+    }
+    return false;
   }
-  function levelSize(v) {
-    const n = Number(v);
-    return Number.isFinite(n) ? n : 0;
-  }
-  function normaliseLevels(raw) {
+
+  function normaliseLevels(raw, dollars) {
     if (!Array.isArray(raw)) return [];
     const out = [];
     for (const l of raw) {
-      let price = null, size = 0;
-      if (Array.isArray(l) && l.length >= 2) {
-        price = levelToCents(l[0]);
-        size = levelSize(l[1]);
-      } else if (l && typeof l === 'object') {
-        price = levelToCents(l.price_dollars ?? l.price ?? l.yes_price_dollars ?? l.yes_price);
-        size = levelSize(l.size_fp ?? l.size ?? l.count_fp ?? l.count);
-      }
-      if (price != null && price > 0 && size > 0) out.push([price, size]);
+      const p = Number(rawPrice(l));
+      const size = Number(rawSize(l));
+      if (!Number.isFinite(p) || !Number.isFinite(size) || size <= 0) continue;
+      const price = dollars ? p * 100 : p;
+      if (price > 0 && price < 100) out.push([price, size]);
     }
     return out;
   }
 
   function readBook(ob) {
     const book = ob?.orderbook ?? ob ?? {};
-    const yes = normaliseLevels(book.yes ?? book.yes_levels);
-    const no = normaliseLevels(book.no ?? book.no_levels);
+    const rawYes = book.yes ?? book.yes_levels ?? [];
+    const rawNo = book.no ?? book.no_levels ?? [];
+    // one decision for both sides — they always share a format
+    const dollars = detectDollars([...(rawYes || []), ...(rawNo || [])]);
+    const yes = normaliseLevels(rawYes, dollars);
+    const no = normaliseLevels(rawNo, dollars);
     const bestYes = yes.length ? yes.reduce((a, b) => (b[0] > a[0] ? b : a)) : null;
     const bestNo = no.length ? no.reduce((a, b) => (b[0] > a[0] ? b : a)) : null;
 
@@ -1424,10 +1451,19 @@ __def('strategy', (module, exports) => {
       `${(o.flow * 100).toFixed(0)}%`,
       'never fade a one-sided tape');
 
-    const okEdge = G('edge',
-      best.net >= F.minEdge,
-      `${best.net.toFixed(1)}¢ @${best.entry}`,
-      'measured at the price this order style would actually pay');
+    let okEdge;
+    if (PROB_MODE) {
+      const pct = best.modelP * 100;
+      okEdge = G('probability',
+        pct >= CFG.MIN_PROB_PCT && best.net >= CFG.MIN_EDGE_PROB_MODE,
+        `${pct.toFixed(1)}% @${best.price}¢ (${best.net.toFixed(1)}¢)`,
+        `fire at ${CFG.MIN_PROB_PCT}%+ confidence, at a posted price below fair`);
+    } else {
+      okEdge = G('edge',
+        best.net >= F.minEdge,
+        `${best.net.toFixed(1)}¢ @${best.entry}`,
+        'measured at the price this order style would actually pay');
+    }
 
     const okExposure = G('exposure',
       exposure.open < slots
@@ -1456,7 +1492,7 @@ __def('strategy', (module, exports) => {
   module.exports = { evaluate, readBook, contractsFor, sizeUsd, FREQ };
 });
 
-// ═══ module: engine ════════════════════════
+// ═══ module: engine ══════════════════════
 __def('engine', (module, exports) => {
   const CFG = __req('config');
   const log = __req('log');
@@ -1754,7 +1790,6 @@ __def('engine', (module, exports) => {
         action: 'buy',
         count: c.contracts,
         priceCents: Math.max(1, Math.min(99, limit)),
-        type: 'limit',
       });
       const order = res.order || res;
       runtime.pending.set(m.ticker, {
@@ -2030,7 +2065,7 @@ __def('engine', (module, exports) => {
   module.exports = { start, runtime, setBet, setSlots, tick, discover, rejectSummary };
 });
 
-// ═══ server ════════════════════════
+// ═══ server ═════════════════════
 const path = require('path');
 const express = require('express');
 const CFG = __req('config');
