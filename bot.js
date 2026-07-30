@@ -15,7 +15,7 @@ function __req(name) {
   return m.exports;
 }
 
-// ═══ module: config ═══════════════════════════════
+// ═══ module: config ═════════════════════════════
 __def('config', (module, exports) => {
   const num = (v, d) => (v === undefined || v === '' || isNaN(Number(v)) ? d : Number(v));
   const bool = (v, d) => (v === undefined || v === '' ? d : String(v).toLowerCase() === 'true');
@@ -158,7 +158,7 @@ __def('config', (module, exports) => {
   module.exports = CFG;
 });
 
-// ═══ module: log ═══════════════════════════════
+// ═══ module: log ═════════════════════════════
 __def('log', (module, exports) => {
   const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
   const min = LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] || 20;
@@ -186,7 +186,7 @@ __def('log', (module, exports) => {
   };
 });
 
-// ═══ module: store ═══════════════════════════════
+// ═══ module: store ═════════════════════════════
 __def('store', (module, exports) => {
   const CFG = __req('config');
 
@@ -303,7 +303,7 @@ __def('store', (module, exports) => {
   module.exports = store;
 });
 
-// ═══ module: kalshi ═══════════════════════════════
+// ═══ module: kalshi ═════════════════════════════
 __def('kalshi', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -461,7 +461,7 @@ __def('kalshi', (module, exports) => {
   module.exports = kalshi;
 });
 
-// ═══ module: pricing ═══════════════════════════════
+// ═══ module: pricing ═════════════════════════════
 __def('pricing', (module, exports) => {
   const CFG = __req('config');
 
@@ -607,7 +607,7 @@ __def('pricing', (module, exports) => {
   module.exports = { fairValue, feeCents, Phi, settleVarMultiplier };
 });
 
-// ═══ module: oracle ═══════════════════════════════
+// ═══ module: oracle ═════════════════════════════
 __def('oracle', (module, exports) => {
   const WebSocket = require('ws');
   const CFG = __req('config');
@@ -940,7 +940,7 @@ __def('oracle', (module, exports) => {
   };
 });
 
-// ═══ module: portfolio ═══════════════════════════════
+// ═══ module: portfolio ═════════════════════════════
 __def('portfolio', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -1159,7 +1159,7 @@ __def('portfolio', (module, exports) => {
   };
 });
 
-// ═══ module: strategy ═══════════════════════════════
+// ═══ module: strategy ═════════════════════════════
 __def('strategy', (module, exports) => {
   const CFG = __req('config');
   const { fairValue, feeCents } = __req('pricing');
@@ -1365,7 +1365,7 @@ __def('strategy', (module, exports) => {
   module.exports = { evaluate, readBook, contractsFor, sizeUsd, FREQ };
 });
 
-// ═══ module: engine ═══════════════════════════════
+// ═══ module: engine ═════════════════════════════
 __def('engine', (module, exports) => {
   const CFG = __req('config');
   const log = __req('log');
@@ -1504,7 +1504,21 @@ __def('engine', (module, exports) => {
       }
     }
     lastDiscovery = Date.now();
-    log.debug(`discovery: ${out.length} open hourly markets`);
+
+    // Break the count down by frequency and by series. A single mislabelled total
+    // makes it impossible to tell a sparse venue from a broken frequency tag.
+    const byFreq = {};
+    const bySeries = {};
+    for (const m of out) {
+      const k = (m._freq || FREQ.hourly).label;
+      byFreq[k] = (byFreq[k] || 0) + 1;
+      bySeries[m._series] = (bySeries[m._series] || 0) + 1;
+    }
+    const freqTxt = Object.entries(byFreq).map(([k, v]) => `${v} ${k}`).join(', ') || 'none';
+    const seriesTxt = Object.entries(bySeries).map(([k, v]) => `${k}:${v}`).join(' ');
+    const empty = runtime.series.filter(x => !bySeries[x.ticker]).map(x => x.ticker);
+    log.debug(`discovery: ${out.length} markets (${freqTxt})${seriesTxt ? ' — ' + seriesTxt : ''}`);
+    if (empty.length) log.debug(`discovery: no markets in window for ${empty.join(', ')}`);
   }
 
   /**
@@ -1895,7 +1909,7 @@ __def('engine', (module, exports) => {
   module.exports = { start, runtime, setBet, setSlots, tick, discover, rejectSummary };
 });
 
-// ═══ server ════════════════════════════════
+// ═══ server ══════════════════════════════
 const path = require('path');
 const express = require('express');
 const CFG = __req('config');
