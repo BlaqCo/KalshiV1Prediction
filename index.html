@@ -406,7 +406,7 @@ function render(s){
   const ct=$('calTag'); ct.style.display=s.calibrationMode?'':'none';
   ct.className='tag paper'; ct.textContent='CALIBRATION — NOT A LIVE CONFIG';
   const st=s.stats;
-  $('equity').innerHTML = money(st.equity)+'<span>EQUITY &nbsp;·&nbsp; '+
+  $('equity').innerHTML = money(st.equity)+'<span>'+(st.bankrollSynced?'EQUITY':'EQUITY (LOCAL)')+' &nbsp;·&nbsp; '+
     '<i class="'+cls(st.realized)+'" style="font-style:normal">'+sgn(st.realized)+' REALISED</i></span>';
   if(!dragging){ $('bet').value=s.bet.usd; $('betVal').textContent='$'+s.bet.usd; }
   $('bet').min=s.bet.min; $('bet').max=s.bet.max;
