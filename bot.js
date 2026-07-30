@@ -15,7 +15,7 @@ function __req(name) {
   return m.exports;
 }
 
-// ═══ module: config ═════════════════════════════
+// ═══ module: config ════════════════════════════
 __def('config', (module, exports) => {
   const num = (v, d) => (v === undefined || v === '' || isNaN(Number(v)) ? d : Number(v));
   const bool = (v, d) => (v === undefined || v === '' ? d : String(v).toLowerCase() === 'true');
@@ -158,7 +158,7 @@ __def('config', (module, exports) => {
   module.exports = CFG;
 });
 
-// ═══ module: log ═════════════════════════════
+// ═══ module: log ════════════════════════════
 __def('log', (module, exports) => {
   const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
   const min = LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] || 20;
@@ -186,7 +186,7 @@ __def('log', (module, exports) => {
   };
 });
 
-// ═══ module: store ═════════════════════════════
+// ═══ module: store ════════════════════════════
 __def('store', (module, exports) => {
   const CFG = __req('config');
 
@@ -303,7 +303,7 @@ __def('store', (module, exports) => {
   module.exports = store;
 });
 
-// ═══ module: kalshi ═════════════════════════════
+// ═══ module: kalshi ════════════════════════════
 __def('kalshi', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -461,7 +461,7 @@ __def('kalshi', (module, exports) => {
   module.exports = kalshi;
 });
 
-// ═══ module: pricing ═════════════════════════════
+// ═══ module: pricing ════════════════════════════
 __def('pricing', (module, exports) => {
   const CFG = __req('config');
 
@@ -607,7 +607,7 @@ __def('pricing', (module, exports) => {
   module.exports = { fairValue, feeCents, Phi, settleVarMultiplier };
 });
 
-// ═══ module: oracle ═════════════════════════════
+// ═══ module: oracle ════════════════════════════
 __def('oracle', (module, exports) => {
   const WebSocket = require('ws');
   const CFG = __req('config');
@@ -940,7 +940,7 @@ __def('oracle', (module, exports) => {
   };
 });
 
-// ═══ module: portfolio ═════════════════════════════
+// ═══ module: portfolio ════════════════════════════
 __def('portfolio', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -1159,7 +1159,7 @@ __def('portfolio', (module, exports) => {
   };
 });
 
-// ═══ module: strategy ═════════════════════════════
+// ═══ module: strategy ════════════════════════════
 __def('strategy', (module, exports) => {
   const CFG = __req('config');
   const { fairValue, feeCents } = __req('pricing');
@@ -1286,17 +1286,34 @@ __def('strategy', (module, exports) => {
       'closed-form and bootstrap must tell the same story');
 
     // --- candidate sides ---
+    //
+    // Evaluate against the price we would ACTUALLY pay under the configured order
+    // style, not against the ask regardless. Crossing a 15c spread costs ~7.5c
+    // versus mid, so an ask-based edge on a wide book is negative before the model
+    // has said anything. Both numbers are reported so you can see the gap.
+    const cross = CFG.ORDER_STYLE === 'cross';
     const cands = [];
-    if (book.yesAsk != null) {
-      const px = book.yesAsk;
-      const gross = fv.p * 100 - px;
-      cands.push({ side: 'yes', price: px, depth: book.yesAskSize, gross, modelP: fv.p });
-    }
-    if (book.noAsk != null) {
-      const px = book.noAsk;
-      const gross = (1 - fv.p) * 100 - px;
-      cands.push({ side: 'no', price: px, depth: book.noAskSize, gross, modelP: 1 - fv.p });
-    }
+
+    const mkSide = (side, ask, askSize, bid, bidSize, p) => {
+      if (ask == null) return;
+      // passive entry improves the bid by a cent; crossing lifts the ask
+      const passive = bid != null ? Math.min(ask, bid + 1) : ask;
+      const price = cross ? ask : passive;
+      if (!(price >= 1 && price <= 99)) return;
+      cands.push({
+        side, price,
+        askPrice: ask, passivePrice: passive,
+        depth: cross ? askSize : bidSize,
+        gross: p * 100 - price,
+        grossCross: p * 100 - ask,
+        grossPassive: p * 100 - passive,
+        modelP: p,
+        entry: cross ? 'cross' : 'post',
+      });
+    };
+
+    mkSide('yes', book.yesAsk, book.yesAskSize, book.yesBid, book.yesBidSize, fv.p);
+    mkSide('no', book.noAsk, book.noAskSize, book.noBid, book.noBidSize, 1 - fv.p);
 
     let best = null;
     for (const c of cands) {
@@ -1307,7 +1324,10 @@ __def('strategy', (module, exports) => {
       c.feeCents = fee;
       c.contracts = n;
       c.usd = (n * c.price) / 100;
-      c.net = c.gross - fee - CFG.SLIPPAGE_CENTS;
+      const slip = cross ? CFG.SLIPPAGE_CENTS : 0;   // posting doesn't pay slippage
+      c.net = c.gross - fee - slip;
+      c.netCross = c.grossCross - fee - CFG.SLIPPAGE_CENTS;
+      c.netPassive = c.grossPassive - fee;
       if (!best || c.net > best.net) best = c;
     }
 
@@ -1335,8 +1355,8 @@ __def('strategy', (module, exports) => {
 
     const okEdge = G('edge',
       best.net >= F.minEdge,
-      `${best.net.toFixed(1)}¢ net`,
-      'after fee and slippage, not before');
+      `${best.net.toFixed(1)}¢ @${best.entry}`,
+      'measured at the price this order style would actually pay');
 
     const okExposure = G('exposure',
       exposure.open < slots
@@ -1365,7 +1385,7 @@ __def('strategy', (module, exports) => {
   module.exports = { evaluate, readBook, contractsFor, sizeUsd, FREQ };
 });
 
-// ═══ module: engine ═════════════════════════════
+// ═══ module: engine ════════════════════════════
 __def('engine', (module, exports) => {
   const CFG = __req('config');
   const log = __req('log');
@@ -1610,6 +1630,9 @@ __def('engine', (module, exports) => {
       capStrike: m._strikes?.cap ?? m.cap_strike ?? null,
       modelP: c.modelP,
       edgeCents: c.net,
+      entryStyle: c.entry,
+      edgeCross: c.netCross,
+      edgePassive: c.netPassive,
       gates: decision.gates,
       fv: {
         p: decision.fv.p, pGauss: decision.fv.pGauss, pEmp: decision.fv.pEmp,
@@ -1624,9 +1647,8 @@ __def('engine', (module, exports) => {
       return pf.open({ ...base, paper: true });
     }
 
-    const limit = CFG.ORDER_STYLE === 'cross'
-      ? c.price + CFG.LIMIT_OFFSET_CENTS
-      : Math.max(1, c.price - 1 - CFG.LIMIT_OFFSET_CENTS);
+    // c.price already reflects the order style, so post exactly what we priced.
+    const limit = Math.max(1, Math.min(99, c.price + CFG.LIMIT_OFFSET_CENTS));
 
     try {
       const res = await kalshi.createOrder({
@@ -1909,7 +1931,7 @@ __def('engine', (module, exports) => {
   module.exports = { start, runtime, setBet, setSlots, tick, discover, rejectSummary };
 });
 
-// ═══ server ══════════════════════════════
+// ═══ server ═════════════════════════════
 const path = require('path');
 const express = require('express');
 const CFG = __req('config');
