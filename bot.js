@@ -15,7 +15,7 @@ function __req(name) {
   return m.exports;
 }
 
-// ═══ module: config ═══════════════════════════
+// ═══ module: config ════════════════════════
 __def('config', (module, exports) => {
   const num = (v, d) => (v === undefined || v === '' || isNaN(Number(v)) ? d : Number(v));
   const bool = (v, d) => (v === undefined || v === '' ? d : String(v).toLowerCase() === 'true');
@@ -102,6 +102,12 @@ __def('config', (module, exports) => {
     // and should never be used with real money — it exists to answer "does the
     // order path work and is the model calibrated", not "does this make money".
     CALIBRATION_MODE: bool(process.env.CALIBRATION_MODE, false),
+
+    // When a market has no offer at all, post our own price and become the book
+    // rather than skipping it. Priced at fair minus the target edge. This is how
+    // you actually trade thin books — but see the paper-fill caveat in the README.
+    QUOTE_EMPTY_BOOKS: bool(process.env.QUOTE_EMPTY_BOOKS, false),
+    QUOTE_MARGIN_CENTS: num(process.env.QUOTE_MARGIN_CENTS, 2),
     FLOW_VETO: num(process.env.FLOW_VETO, 0.72),             // |flow| above this vetoes fades
 
     // ---------- sizing & risk ----------
@@ -161,7 +167,7 @@ __def('config', (module, exports) => {
   module.exports = CFG;
 });
 
-// ═══ module: log ═══════════════════════════
+// ═══ module: log ════════════════════════
 __def('log', (module, exports) => {
   const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
   const min = LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] || 20;
@@ -189,7 +195,7 @@ __def('log', (module, exports) => {
   };
 });
 
-// ═══ module: store ═══════════════════════════
+// ═══ module: store ════════════════════════
 __def('store', (module, exports) => {
   const CFG = __req('config');
 
@@ -306,7 +312,7 @@ __def('store', (module, exports) => {
   module.exports = store;
 });
 
-// ═══ module: kalshi ═══════════════════════════
+// ═══ module: kalshi ════════════════════════
 __def('kalshi', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -436,22 +442,34 @@ __def('kalshi', (module, exports) => {
      * side: 'yes' | 'no'; action: 'buy' | 'sell'
      * priceCents is the limit for the chosen side (1..99).
      */
-    createOrder: ({ ticker, side, action, count, priceCents, clientOrderId, type = 'limit', tif }) => {
+    /**
+     * `order_type` is no longer required and only limit orders exist. Kalshi is
+     * mid-migration to fixed-point, so send the integer-cent price alongside its
+     * `_dollars` and `_fp` equivalents — extra fields are ignored by whichever
+     * side of the migration this environment is on.
+     */
+    createOrder: ({ ticker, side, action, count, priceCents, clientOrderId, tif }) => {
+      const cents = Math.max(1, Math.min(99, Math.round(priceCents)));
+      const dollars = (cents / 100).toFixed(4);
       const body = {
         ticker,
         action,
         side,
         count,
-        type,
+        count_fp: Number(count).toFixed(2),
         client_order_id: clientOrderId || crypto.randomUUID(),
       };
-      if (type === 'limit') {
-        if (side === 'yes') body.yes_price = Math.round(priceCents);
-        else body.no_price = Math.round(priceCents);
-      }
+      if (side === 'yes') { body.yes_price = cents; body.yes_price_dollars = dollars; }
+      else { body.no_price = cents; body.no_price_dollars = dollars; }
       if (tif) body.time_in_force = tif;
       return request('POST', '/portfolio/orders', { body });
     },
+
+    /** Batch orderbooks — up to 100 tickers in one call instead of N calls. */
+    orderbooks: (tickers, depth = 5) =>
+      request('GET', '/markets/orderbooks', {
+        query: { tickers: tickers.slice(0, 100).join(','), depth },
+      }),
 
     cancelOrder: id => request('DELETE', `/portfolio/orders/${encodeURIComponent(id)}`),
 
@@ -464,7 +482,7 @@ __def('kalshi', (module, exports) => {
   module.exports = kalshi;
 });
 
-// ═══ module: pricing ═══════════════════════════
+// ═══ module: pricing ════════════════════════
 __def('pricing', (module, exports) => {
   const CFG = __req('config');
 
@@ -610,7 +628,7 @@ __def('pricing', (module, exports) => {
   module.exports = { fairValue, feeCents, Phi, settleVarMultiplier };
 });
 
-// ═══ module: oracle ═══════════════════════════
+// ═══ module: oracle ════════════════════════
 __def('oracle', (module, exports) => {
   const WebSocket = require('ws');
   const CFG = __req('config');
@@ -943,7 +961,7 @@ __def('oracle', (module, exports) => {
   };
 });
 
-// ═══ module: portfolio ═══════════════════════════
+// ═══ module: portfolio ════════════════════════
 __def('portfolio', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -1162,7 +1180,7 @@ __def('portfolio', (module, exports) => {
   };
 });
 
-// ═══ module: strategy ═══════════════════════════
+// ═══ module: strategy ════════════════════════
 __def('strategy', (module, exports) => {
   const CFG = __req('config');
   const { fairValue, feeCents } = __req('pricing');
@@ -1193,9 +1211,47 @@ __def('strategy', (module, exports) => {
     },
   };
 
+  /**
+   * Kalshi has been migrating off integer cents toward fixed-point `_dollars`
+   * strings and `_fp` contract counts, and is rolling finer tick structures out
+   * from the week of 2026-07-27. A level may therefore arrive as [95, 200],
+   * ["0.9500", "200.00"], or {price_dollars, size_fp}. Normalise all of them to
+   * cents + contracts rather than assuming one shape — a silently unparsed book
+   * looks exactly like an empty book.
+   */
+  function levelToCents(v) {
+    if (v == null) return null;
+    if (typeof v === 'number') return v > 1 ? v : v * 100;   // cents, or dollars <=1
+    const n = Number(v);
+    if (!Number.isFinite(n)) return null;
+    // a decimal point means dollars; a bare integer means cents
+    return String(v).includes('.') ? n * 100 : n;
+  }
+  function levelSize(v) {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : 0;
+  }
+  function normaliseLevels(raw) {
+    if (!Array.isArray(raw)) return [];
+    const out = [];
+    for (const l of raw) {
+      let price = null, size = 0;
+      if (Array.isArray(l) && l.length >= 2) {
+        price = levelToCents(l[0]);
+        size = levelSize(l[1]);
+      } else if (l && typeof l === 'object') {
+        price = levelToCents(l.price_dollars ?? l.price ?? l.yes_price_dollars ?? l.yes_price);
+        size = levelSize(l.size_fp ?? l.size ?? l.count_fp ?? l.count);
+      }
+      if (price != null && price > 0 && size > 0) out.push([price, size]);
+    }
+    return out;
+  }
+
   function readBook(ob) {
-    const yes = (ob?.orderbook?.yes || []).filter(l => Array.isArray(l) && l.length >= 2);
-    const no = (ob?.orderbook?.no || []).filter(l => Array.isArray(l) && l.length >= 2);
+    const book = ob?.orderbook ?? ob ?? {};
+    const yes = normaliseLevels(book.yes ?? book.yes_levels);
+    const no = normaliseLevels(book.no ?? book.no_levels);
     const bestYes = yes.length ? yes.reduce((a, b) => (b[0] > a[0] ? b : a)) : null;
     const bestNo = no.length ? no.reduce((a, b) => (b[0] > a[0] ? b : a)) : null;
 
@@ -1217,7 +1273,8 @@ __def('strategy', (module, exports) => {
 
   function contractsFor(usd, priceCents, depth) {
     const n = Math.floor((usd * 100) / Math.max(1, priceCents));
-    return Math.max(0, Math.min(n, depth || 0));
+    const cap = Number.isFinite(depth) ? depth : n;   // quoting: no counterparty cap
+    return Math.max(0, Math.min(n, cap || 0));
   }
 
   function sizeUsd(edgeCents, betUsd) {
@@ -1262,9 +1319,10 @@ __def('strategy', (module, exports) => {
       `${Math.round(tau)}s`,
       'skip the gamma lottery at the bell and the dead zone at the open');
 
+    const quoting = CFG.QUOTE_EMPTY_BOOKS && book.yesAsk == null && book.noAsk == null;
     const okBook = G('liquidity',
-      book.spread != null && book.spread <= F.maxSpread,
-      book.spread == null ? 'no book' : `${book.spread}¢`,
+      quoting || (book.spread != null && book.spread <= F.maxSpread),
+      book.spread == null ? (quoting ? 'empty — quoting' : 'no book') : `${book.spread}¢`,
       'crossing a wide book eats the edge you came for');
 
     const regime = o.sigmaBaseline > 0 ? o.sigma / o.sigmaBaseline : 1;
@@ -1298,20 +1356,30 @@ __def('strategy', (module, exports) => {
     const cands = [];
 
     const mkSide = (side, ask, askSize, bid, bidSize, p) => {
-      if (ask == null) return;
-      // passive entry improves the bid by a cent; crossing lifts the ask
-      const passive = bid != null ? Math.min(ask, bid + 1) : ask;
-      const price = cross ? ask : passive;
+      let price, depth, entry, passive = null;
+
+      if (ask != null) {
+        // passive entry improves the bid by a cent; crossing lifts the ask
+        passive = bid != null ? Math.min(ask, bid + 1) : ask;
+        price = cross ? ask : passive;
+        depth = cross ? askSize : bidSize;
+        entry = cross ? 'cross' : 'post';
+      } else if (CFG.QUOTE_EMPTY_BOOKS) {
+        // Nobody is offering. Make our own market at fair minus the target edge,
+        // so the order only pays off if the model is right by that margin.
+        price = Math.round(p * 100 - F.minEdge - CFG.QUOTE_MARGIN_CENTS);
+        depth = Infinity;          // no counterparty to measure
+        entry = 'quote';
+      } else return;
+
       if (!(price >= 1 && price <= 99)) return;
       cands.push({
-        side, price,
+        side, price, entry, depth,
         askPrice: ask, passivePrice: passive,
-        depth: cross ? askSize : bidSize,
         gross: p * 100 - price,
-        grossCross: p * 100 - ask,
-        grossPassive: p * 100 - passive,
+        grossCross: ask != null ? p * 100 - ask : null,
+        grossPassive: passive != null ? p * 100 - passive : null,
         modelP: p,
-        entry: cross ? 'cross' : 'post',
       });
     };
 
@@ -1340,8 +1408,8 @@ __def('strategy', (module, exports) => {
     }
 
     const okDepth = G('depth',
-      best.depth >= Math.min(CAL ? 1 : CFG.MIN_BOOK_DEPTH, best.contracts),
-      `${best.depth} @ touch`,
+      best.entry === 'quote' || best.depth >= Math.min(CAL ? 1 : CFG.MIN_BOOK_DEPTH, best.contracts),
+      best.entry === 'quote' ? 'n/a — quoting' : `${best.depth} @ touch`,
       'need real size at the touch, not a one-lot');
 
     const okPrice = G('price band',
@@ -1388,7 +1456,7 @@ __def('strategy', (module, exports) => {
   module.exports = { evaluate, readBook, contractsFor, sizeUsd, FREQ };
 });
 
-// ═══ module: engine ═══════════════════════════
+// ═══ module: engine ════════════════════════
 __def('engine', (module, exports) => {
   const CFG = __req('config');
   const log = __req('log');
@@ -1830,8 +1898,10 @@ __def('engine', (module, exports) => {
     const need = new Set([...candidates.map(m => m.ticker), ...openTickers]);
 
     for (const ticker of need) {
-      try { books[ticker] = await kalshi.orderbook(ticker, 5); }
-      catch (e) { runtime.errors += 1; }
+      try {
+        books[ticker] = await kalshi.orderbook(ticker, 5);
+        if (!runtime.rawBook) runtime.rawBook = { ticker, raw: books[ticker] };
+      } catch (e) { runtime.errors += 1; }
     }
 
     await manage(books);
@@ -1960,7 +2030,7 @@ __def('engine', (module, exports) => {
   module.exports = { start, runtime, setBet, setSlots, tick, discover, rejectSummary };
 });
 
-// ═══ server ════════════════════════════
+// ═══ server ════════════════════════
 const path = require('path');
 const express = require('express');
 const CFG = __req('config');
@@ -2028,6 +2098,7 @@ app.get('/api/state', (req, res) => {
     },
     rawSamples: engine.runtime.rawSamples,
     discovery: engine.runtime.discovery,
+    rawBook: engine.runtime.rawBook,
     calibrationMode: CFG.CALIBRATION_MODE,
     positions: pf.positions(),
     trades: pf.trades(60),
