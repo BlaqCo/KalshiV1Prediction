@@ -1,12 +1,8 @@
 'use strict';
 /**
  * 0XBLAQ · KALSHI ENGINE — single-file build
- *
- * Hourly and quarter-hour crypto binaries. Ten modules held in separate scopes
- * by a ~10 line inline registry, so the code reads as it would across ten files
- * and nothing leaks between them. Search `=== module: name ===` to jump around.
- *
- * Companion files: index.html (dashboard), package.json.
+ * Hourly and quarter-hour crypto binaries. Ten modules in separate scopes via a
+ * small inline registry. Search `=== module: name ===` to jump around.
  */
 
 const __registry = {};
@@ -20,7 +16,7 @@ function __req(name) {
   return m.exports;
 }
 
-// ═══ module: config ════════════════════════════════════
+// ═══ module: config ══════════════════════════════════
 __def('config', (module, exports) => {
   const num = (v, d) => (v === undefined || v === '' || isNaN(Number(v)) ? d : Number(v));
   const bool = (v, d) => (v === undefined || v === '' ? d : String(v).toLowerCase() === 'true');
@@ -156,7 +152,7 @@ __def('config', (module, exports) => {
   module.exports = CFG;
 });
 
-// ═══ module: log ════════════════════════════════════
+// ═══ module: log ══════════════════════════════════
 __def('log', (module, exports) => {
   const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
   const min = LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] || 20;
@@ -184,7 +180,7 @@ __def('log', (module, exports) => {
   };
 });
 
-// ═══ module: store ════════════════════════════════════
+// ═══ module: store ══════════════════════════════════
 __def('store', (module, exports) => {
   const CFG = __req('config');
 
@@ -301,7 +297,7 @@ __def('store', (module, exports) => {
   module.exports = store;
 });
 
-// ═══ module: kalshi ════════════════════════════════════
+// ═══ module: kalshi ══════════════════════════════════
 __def('kalshi', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -459,7 +455,7 @@ __def('kalshi', (module, exports) => {
   module.exports = kalshi;
 });
 
-// ═══ module: pricing ════════════════════════════════════
+// ═══ module: pricing ══════════════════════════════════
 __def('pricing', (module, exports) => {
   const CFG = __req('config');
 
@@ -605,7 +601,7 @@ __def('pricing', (module, exports) => {
   module.exports = { fairValue, feeCents, Phi, settleVarMultiplier };
 });
 
-// ═══ module: oracle ════════════════════════════════════
+// ═══ module: oracle ══════════════════════════════════
 __def('oracle', (module, exports) => {
   const WebSocket = require('ws');
   const CFG = __req('config');
@@ -933,7 +929,7 @@ __def('oracle', (module, exports) => {
   };
 });
 
-// ═══ module: portfolio ════════════════════════════════════
+// ═══ module: portfolio ══════════════════════════════════
 __def('portfolio', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -1152,7 +1148,7 @@ __def('portfolio', (module, exports) => {
   };
 });
 
-// ═══ module: strategy ════════════════════════════════════
+// ═══ module: strategy ══════════════════════════════════
 __def('strategy', (module, exports) => {
   const CFG = __req('config');
   const { fairValue, feeCents } = __req('pricing');
@@ -1355,7 +1351,7 @@ __def('strategy', (module, exports) => {
   module.exports = { evaluate, readBook, contractsFor, sizeUsd, FREQ };
 });
 
-// ═══ module: engine ════════════════════════════════════
+// ═══ module: engine ══════════════════════════════════
 __def('engine', (module, exports) => {
   const CFG = __req('config');
   const log = __req('log');
@@ -1365,6 +1361,62 @@ __def('engine', (module, exports) => {
   const { evaluate, readBook, FREQ } = __req('strategy');
   const { feeCents, fairValue } = __req('pricing');
   const store = __req('store');
+
+  /**
+   * Rolling rejection ledger, six 10-minute buckets.
+   *
+   * `failed` counts every time a gate said no. `sole` counts the times it was the
+   * ONLY gate saying no — which is the actionable number: loosen that one gate and
+   * those candidates would have fired. A gate with a huge `failed` but zero `sole`
+   * is riding along behind a stricter gate and isn't costing you anything.
+   */
+  const BUCKET_MS = 10 * 60 * 1000;
+  const rejects = { buckets: [] };
+
+  function rejectBucket() {
+    const now = Date.now();
+    const slot = Math.floor(now / BUCKET_MS);
+    let b = rejects.buckets[rejects.buckets.length - 1];
+    if (!b || b.slot !== slot) {
+      b = { slot, t: now, evaluated: 0, fired: 0, gates: {} };
+      rejects.buckets.push(b);
+      while (rejects.buckets.length > 6) rejects.buckets.shift();
+    }
+    return b;
+  }
+
+  function recordDecision(d) {
+    const b = rejectBucket();
+    b.evaluated += 1;
+    if (d.fire) { b.fired += 1; return; }
+    const failing = (d.gates || []).filter(g => !g.pass);
+    const sole = failing.length === 1 ? failing[0].name : null;
+    for (const g of failing) {
+      const e = b.gates[g.name] || { failed: 0, sole: 0, lastValue: null };
+      e.failed += 1;
+      if (g.name === sole) e.sole += 1;
+      e.lastValue = g.value;
+      b.gates[g.name] = e;
+    }
+  }
+
+  function rejectSummary() {
+    const cutoff = Date.now() - 6 * BUCKET_MS;
+    const live = rejects.buckets.filter(b => b.t >= cutoff);
+    const out = { windowMin: 60, evaluated: 0, fired: 0, gates: [] };
+    const acc = {};
+    for (const b of live) {
+      out.evaluated += b.evaluated;
+      out.fired += b.fired;
+      for (const [n, e] of Object.entries(b.gates)) {
+        const a = acc[n] || { name: n, failed: 0, sole: 0, lastValue: null };
+        a.failed += e.failed; a.sole += e.sole; a.lastValue = e.lastValue ?? a.lastValue;
+        acc[n] = a;
+      }
+    }
+    out.gates = Object.values(acc).sort((x, y) => y.sole - x.sole || y.failed - x.failed);
+    return out;
+  }
 
   const runtime = {
     betUsd: CFG.BET_USD,
@@ -1669,6 +1721,8 @@ __def('engine', (module, exports) => {
         exposure: pf.exposure(),
       });
 
+      recordDecision(decision);
+
       view.push({
         ticker: m.ticker,
         asset: m._asset,
@@ -1771,10 +1825,10 @@ __def('engine', (module, exports) => {
     return v;
   }
 
-  module.exports = { start, runtime, setBet, setSlots, tick, discover };
+  module.exports = { start, runtime, setBet, setSlots, tick, discover, rejectSummary };
 });
 
-// ═══ server ══════════════════════════════════════
+// ═══ server ════════════════════════════════════
 const path = require('path');
 const express = require('express');
 const CFG = __req('config');
@@ -1833,6 +1887,7 @@ app.get('/api/state', (req, res) => {
     feeds: oracle.feedStatus(),
     series: engine.runtime.series,
     markets: engine.runtime.markets,
+    rejects: engine.rejectSummary(),
     positions: pf.positions(),
     trades: pf.trades(60),
     stats: pf.stats(),
