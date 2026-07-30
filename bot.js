@@ -15,7 +15,7 @@ function __req(name) {
   return m.exports;
 }
 
-// ═══ module: config ════════════════════════════
+// ═══ module: config ═══════════════════════════
 __def('config', (module, exports) => {
   const num = (v, d) => (v === undefined || v === '' || isNaN(Number(v)) ? d : Number(v));
   const bool = (v, d) => (v === undefined || v === '' ? d : String(v).toLowerCase() === 'true');
@@ -80,6 +80,9 @@ __def('config', (module, exports) => {
     FLOW_TILT_MAX_BPS: num(process.env.FLOW_TILT_MAX_BPS, 6),
 
     // ---------- gates ----------
+    // How far past the trading window discovery still caches markets. Too small
+    // and a market is only noticed after it is already inside the gate window.
+    DISCOVERY_LOOKAHEAD_S: num(process.env.DISCOVERY_LOOKAHEAD_S, 5400),
     MIN_SECONDS_TO_CLOSE: num(process.env.MIN_SECONDS_TO_CLOSE, 90),
     MAX_SECONDS_TO_CLOSE: num(process.env.MAX_SECONDS_TO_CLOSE, 2700),
     MAX_SPREAD_CENTS: num(process.env.MAX_SPREAD_CENTS, 4),
@@ -158,7 +161,7 @@ __def('config', (module, exports) => {
   module.exports = CFG;
 });
 
-// ═══ module: log ════════════════════════════
+// ═══ module: log ═══════════════════════════
 __def('log', (module, exports) => {
   const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
   const min = LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] || 20;
@@ -186,7 +189,7 @@ __def('log', (module, exports) => {
   };
 });
 
-// ═══ module: store ════════════════════════════
+// ═══ module: store ═══════════════════════════
 __def('store', (module, exports) => {
   const CFG = __req('config');
 
@@ -303,7 +306,7 @@ __def('store', (module, exports) => {
   module.exports = store;
 });
 
-// ═══ module: kalshi ════════════════════════════
+// ═══ module: kalshi ═══════════════════════════
 __def('kalshi', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -461,7 +464,7 @@ __def('kalshi', (module, exports) => {
   module.exports = kalshi;
 });
 
-// ═══ module: pricing ════════════════════════════
+// ═══ module: pricing ═══════════════════════════
 __def('pricing', (module, exports) => {
   const CFG = __req('config');
 
@@ -607,7 +610,7 @@ __def('pricing', (module, exports) => {
   module.exports = { fairValue, feeCents, Phi, settleVarMultiplier };
 });
 
-// ═══ module: oracle ════════════════════════════
+// ═══ module: oracle ═══════════════════════════
 __def('oracle', (module, exports) => {
   const WebSocket = require('ws');
   const CFG = __req('config');
@@ -940,7 +943,7 @@ __def('oracle', (module, exports) => {
   };
 });
 
-// ═══ module: portfolio ════════════════════════════
+// ═══ module: portfolio ═══════════════════════════
 __def('portfolio', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -1159,7 +1162,7 @@ __def('portfolio', (module, exports) => {
   };
 });
 
-// ═══ module: strategy ════════════════════════════
+// ═══ module: strategy ═══════════════════════════
 __def('strategy', (module, exports) => {
   const CFG = __req('config');
   const { fairValue, feeCents } = __req('pricing');
@@ -1385,7 +1388,7 @@ __def('strategy', (module, exports) => {
   module.exports = { evaluate, readBook, contractsFor, sizeUsd, FREQ };
 });
 
-// ═══ module: engine ════════════════════════════
+// ═══ module: engine ═══════════════════════════
 __def('engine', (module, exports) => {
   const CFG = __req('config');
   const log = __req('log');
@@ -1490,18 +1493,32 @@ __def('engine', (module, exports) => {
 
   async function discover() {
     const out = [];
+    const diag = {};
     for (const series of runtime.series) {
       const asset = assetFromSeries(series.ticker);
       if (!asset) continue;
       try {
         const res = await kalshi.markets(series.ticker, 200);
         const F = series.freq;
-        for (const m of res.markets || []) {
+        const all = res.markets || [];
+        // Same lesson as the prefilter: a rejected market must never vanish
+        // silently. Record what the API returned and exactly why each one died.
+        const d = { returned: all.length, badStatus: 0, expired: 0, tooFarOut: 0,
+                    kept: 0, statuses: {}, nearestTau: null, farthestTau: null };
+        for (const m of all) {
+          d.statuses[m.status] = (d.statuses[m.status] || 0) + 1;
           const tau = (Date.parse(m.close_time) - Date.now()) / 1000;
-          if (!(tau > 0) || tau > F.maxSec + 600) continue;
-          if (m.status !== 'active' && m.status !== 'open') continue;
+          if (Number.isFinite(tau)) {
+            if (d.nearestTau == null || (tau > 0 && tau < d.nearestTau)) d.nearestTau = Math.round(tau);
+            if (d.farthestTau == null || tau > d.farthestTau) d.farthestTau = Math.round(tau);
+          }
+          if (m.status !== 'active' && m.status !== 'open') { d.badStatus += 1; continue; }
+          if (!(tau > 0)) { d.expired += 1; continue; }
+          if (tau > F.maxSec + CFG.DISCOVERY_LOOKAHEAD_S) { d.tooFarOut += 1; continue; }
+          d.kept += 1;
           out.push({ ...m, _asset: asset, _series: series.ticker, _freq: F });
         }
+        diag[series.ticker] = d;
       } catch (e) {
         runtime.errors += 1;
         log.warn(`discover ${series.ticker}: ${e.message}`);
@@ -1538,7 +1555,19 @@ __def('engine', (module, exports) => {
     const seriesTxt = Object.entries(bySeries).map(([k, v]) => `${k}:${v}`).join(' ');
     const empty = runtime.series.filter(x => !bySeries[x.ticker]).map(x => x.ticker);
     log.debug(`discovery: ${out.length} markets (${freqTxt})${seriesTxt ? ' — ' + seriesTxt : ''}`);
-    if (empty.length) log.debug(`discovery: no markets in window for ${empty.join(', ')}`);
+
+    runtime.discovery = diag;
+    for (const t of empty) {
+      const d = diag[t];
+      if (!d) { log.debug(`discovery: ${t} — request failed`); continue; }
+      if (!d.returned) { log.warn(`discovery: ${t} — API returned 0 markets (check the series ticker)`); continue; }
+      const why = [];
+      if (d.badStatus) why.push(`${d.badStatus} not open (${Object.entries(d.statuses).map(([k, v]) => `${k}:${v}`).join(' ')})`);
+      if (d.expired) why.push(`${d.expired} already closed`);
+      if (d.tooFarOut) why.push(`${d.tooFarOut} beyond the lookahead`);
+      log.warn(`discovery: ${t} — API returned ${d.returned}, kept 0 [${why.join(', ')}]`
+        + ` nearest closes in ${d.nearestTau}s, farthest ${d.farthestTau}s`);
+    }
   }
 
   /**
@@ -1931,7 +1960,7 @@ __def('engine', (module, exports) => {
   module.exports = { start, runtime, setBet, setSlots, tick, discover, rejectSummary };
 });
 
-// ═══ server ═════════════════════════════
+// ═══ server ════════════════════════════
 const path = require('path');
 const express = require('express');
 const CFG = __req('config');
@@ -1998,6 +2027,7 @@ app.get('/api/state', (req, res) => {
       evaluated: (engine.runtime.markets || []).length,
     },
     rawSamples: engine.runtime.rawSamples,
+    discovery: engine.runtime.discovery,
     calibrationMode: CFG.CALIBRATION_MODE,
     positions: pf.positions(),
     trades: pf.trades(60),
