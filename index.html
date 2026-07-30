@@ -201,6 +201,7 @@ canvas.eq{width:100%;height:130px;display:block}
     <span class="tag" id="modeTag">—</span>
     <span class="tag" id="feedTag">ORACLE</span>
     <span class="tag" id="redisTag">REDIS</span>
+    <span class="tag" id="calTag" style="display:none">CALIBRATION</span>
     <div class="spacer"></div>
     <div class="equity" id="equity">—<span>EQUITY</span></div>
   </div>
@@ -256,6 +257,7 @@ canvas.eq{width:100%;height:130px;display:block}
 
   <section class="panel">
     <div class="phead"><h2>Why nothing fired</h2><div class="note" id="rejNote">last 60 min</div></div>
+    <div class="rejlead" id="funnel"></div>
     <div class="rejlead" id="rejLead"></div>
     <div class="rej" id="rej"></div>
   </section>
@@ -340,6 +342,8 @@ function render(s){
   const f=$('feedTag'); f.textContent='ORACLE '+alive+'/'+(s.feeds||[]).length;
   f.className='tag '+(alive>=2?'ok':'off');
   const rd=$('redisTag'); rd.textContent=s.redis?'REDIS':'REDIS OFF'; rd.className='tag '+(s.redis?'ok':'off');
+  const ct=$('calTag'); ct.style.display=s.calibrationMode?'':'none';
+  ct.className='tag paper'; ct.textContent='CALIBRATION — NOT A LIVE CONFIG';
   const st=s.stats;
   $('equity').innerHTML = money(st.equity)+'<span>EQUITY &nbsp;·&nbsp; '+
     '<i class="'+cls(st.realized)+'" style="font-style:normal">'+sgn(st.realized)+' REALISED</i></span>';
@@ -636,6 +640,15 @@ function renderTrades(s){
 /* A gate with a big bar but no amber isn't costing you anything — it's failing
    behind something stricter. Amber is the gate to actually reconsider. */
 function renderRejects(s){
+  const f=s.funnel||{};
+  const d=f.drops||{};
+  const named={noOracle:'no oracle',outOfTime:'outside time window',noStrike:'no strike field',
+    noModel:'model returned nothing',tooFar:'too far from spot',capped:'ladder cap'};
+  const parts=Object.entries(d).filter(([,v])=>v>0).map(([k,v])=>`${v} ${named[k]||k}`);
+  $('funnel').innerHTML = f.discovered!=null
+    ? `<b>${f.discovered}</b> discovered → <b>${f.evaluated||0}</b> reached the gates`
+      + (parts.length?` · dropped before gates: ${parts.join(', ')}`:'')
+    : '';
   const r=s.rejects||{evaluated:0,fired:0,gates:[]};
   $('rejNote').textContent = `${r.evaluated} evaluated · ${r.fired} fired · last 60m`;
   if(!r.evaluated){
