@@ -499,13 +499,15 @@ function renderBoard(s){
       </div>
       <div class="kv">
         <div><span>SIDE</span><b class="${c?(c.side==='yes'?'up':''):'mut'}">${c?c.side.toUpperCase():'—'}</b></div>
-        <div><span>ASK</span><b>${c?c.price+'¢':'—'}</b></div>
+        <div><span>${c?(c.entry==='cross'?'LIFT ASK':'POST AT'):'PRICE'}</span><b>${c?c.price+'¢':'—'}</b></div>
         <div><span>FAIR</span><b style="color:var(--model)">${mdl!=null?(mdl*100).toFixed(1)+'¢':'—'}</b></div>
         <div><span>NET EDGE</span><b class="${edge>0?'up':edge<0?'down':'mut'}">${edge!=null?edge.toFixed(1)+'¢':'—'}</b></div>
         <div><span>Z</span><b>${fv?fv.z.toFixed(2):'—'}</b></div>
         <div><span>σ EFF</span><b>${fv?fv.sigmaEffBps.toFixed(0)+'bp':'—'}</b></div>
         <div><span>DRIFT</span><b style="color:var(--model)">${fv?(fv.driftBps>=0?'+':'')+fv.driftBps.toFixed(1)+'bp':'—'}</b></div>
-        <div><span>SPREAD</span><b>${b.spread!=null?b.spread+'¢':'—'}</b></div>
+        <div><span>SPREAD</span><b class="${b.spread>8?'down':''}">${b.spread!=null?b.spread+'¢':'—'}</b></div>
+        <div><span>IF CROSSED</span><b class="${c&&c.netCross>0?'up':'mut'}">${c&&c.netCross!=null?c.netCross.toFixed(1)+'¢':'—'}</b></div>
+        <div><span>IF POSTED</span><b class="${c&&c.netPassive>0?'up':'mut'}">${c&&c.netPassive!=null?c.netPassive.toFixed(1)+'¢':'—'}</b></div>
       </div>
       <div class="gates">${(m.gates||[]).map(g=>
         `<span class="g ${g.pass?'pass':(blockers.length<=2?'blocker':'fail')}" title="${esc(g.detail||'')}"
@@ -620,7 +622,9 @@ function detailRow(key,t,span){
       ${cell('FLOW TILT',fv.tiltBps!=null?fv.tiltBps.toFixed(1)+'bp':'—')}
       ${cell('STAKE',money(t.costUsd))}
       ${cell('ENTRY FEE',money(t.feeUsd||0))}
-      ${cell('EDGE AT ENTRY',t.edgeCents.toFixed(2)+'¢')}
+      ${cell('EDGE AT ENTRY',t.edgeCents.toFixed(2)+'¢ @'+(t.entryStyle||'cross'))}
+      ${t.edgeCross!=null?cell('IF CROSSED',t.edgeCross.toFixed(2)+'¢'):''}
+      ${t.edgePassive!=null?cell('IF POSTED',t.edgePassive.toFixed(2)+'¢'):''}
       ${t.exitReason?cell('EXIT',esc(t.exitReason)):''}
       ${t.holdSec!=null?cell('HELD',clock(t.holdSec)):''}
       ${t.roiPct!=null?cell('ROI','<span class="'+cls(t.roiPct)+'">'+t.roiPct.toFixed(1)+'%</span>'):''}
