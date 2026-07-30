@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>0XBLAQ · Kalshi Hourly</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#06080A; --panel:#0B0F12; --panel2:#0E1418; --rule:#161E23;
+  --ink:#D7E0DD; --dim:#64757A; --dimmer:#3B474C;
+  --sig:#00F0A0;          /* the bot: fills, profit, market truth */
+  --model:#9B7BFF;        /* the model: fair value, distribution */
+  --warn:#FFC24D; --loss:#FF4F6D;
+  --mono:'IBM Plex Mono',ui-monospace,Menlo,monospace;
+  --disp:'Space Grotesk',var(--mono);
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);
+  font-family:var(--mono);font-size:13px;line-height:1.45;
+  -webkit-font-smoothing:antialiased;overscroll-behavior-y:none}
+body{padding:0 0 48px;background-image:radial-gradient(ellipse 90% 50% at 50% -10%,#0B1A16 0%,transparent 70%)}
+a{color:var(--sig);text-decoration:none}
+
+/* ---------- header ---------- */
+header{position:sticky;top:0;z-index:20;background:rgba(6,8,10,.92);
+  backdrop-filter:blur(14px);border-bottom:1px solid var(--rule);padding:10px 14px}
+.brandrow{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.brand{font-family:var(--disp);font-weight:700;font-size:15px;letter-spacing:.09em}
+.brand small{color:var(--dim);font-weight:500;letter-spacing:.16em;font-size:10px;display:block}
+.tag{font-size:9.5px;letter-spacing:.16em;padding:3px 7px;border:1px solid;border-radius:2px;text-transform:uppercase}
+.tag.paper{color:var(--warn);border-color:#4A3A14;background:#171106}
+.tag.live{color:var(--loss);border-color:#4A1620;background:#170609}
+.tag.ok{color:var(--sig);border-color:#0C3D2C;background:#04140E}
+.tag.off{color:var(--dimmer);border-color:var(--rule)}
+.spacer{flex:1}
+.equity{text-align:right;font-family:var(--disp);font-weight:700;font-size:19px;letter-spacing:-.01em}
+.equity span{display:block;font-family:var(--mono);font-weight:400;font-size:10px;
+  letter-spacing:.12em;color:var(--dim)}
+
+.betbar{display:flex;align-items:center;gap:10px;margin-top:9px;padding-top:9px;border-top:1px solid var(--rule)}
+.betbar label{font-size:9.5px;letter-spacing:.14em;color:var(--dim);white-space:nowrap}
+input[type=range]{flex:1;-webkit-appearance:none;appearance:none;height:2px;background:var(--rule);
+  border-radius:2px;outline:none;min-width:80px}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;
+  background:var(--sig);border:3px solid var(--bg);box-shadow:0 0 0 1px var(--sig);cursor:pointer}
+input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:var(--sig);
+  border:3px solid var(--bg);box-shadow:0 0 0 1px var(--sig);cursor:pointer}
+input[type=range]:focus-visible{outline:2px solid var(--model);outline-offset:4px}
+.betval{font-family:var(--disp);font-weight:700;font-size:17px;color:var(--sig);min-width:56px;text-align:right}
+button{font-family:var(--mono);font-size:10px;letter-spacing:.12em;padding:6px 11px;border-radius:2px;
+  background:transparent;color:var(--dim);border:1px solid var(--rule);cursor:pointer;text-transform:uppercase}
+button:hover{color:var(--ink);border-color:var(--dimmer)}
+button:focus-visible{outline:2px solid var(--model);outline-offset:2px}
+button.hot{color:var(--warn);border-color:#4A3A14}
+
+/* ---------- layout ---------- */
+.wrap{padding:14px;display:grid;gap:14px;max-width:1560px;margin:0 auto}
+@media(min-width:1100px){.cols{display:grid;grid-template-columns:290px 1fr;gap:14px;align-items:start}}
+.panel{background:var(--panel);border:1px solid var(--rule);border-radius:3px}
+.phead{display:flex;align-items:baseline;gap:8px;padding:9px 12px;border-bottom:1px solid var(--rule)}
+.phead h2{margin:0;font-family:var(--disp);font-weight:700;font-size:11px;letter-spacing:.18em;text-transform:uppercase}
+.phead .note{font-size:9.5px;color:var(--dim);letter-spacing:.06em;margin-left:auto;text-align:right}
+
+/* ---------- oracle rail ---------- */
+.asset{padding:10px 12px;border-bottom:1px solid var(--rule)}
+.asset:last-child{border-bottom:none}
+.assetTop{display:flex;align-items:baseline;gap:8px}
+.sym{font-family:var(--disp);font-weight:700;font-size:13px;letter-spacing:.05em}
+.px{margin-left:auto;font-size:13px;font-variant-numeric:tabular-nums}
+.sub{display:flex;gap:12px;font-size:10px;color:var(--dim);margin-top:3px;flex-wrap:wrap}
+.sub b{color:var(--ink);font-weight:500}
+
+/* signature instrument #1: the index-lag meter */
+.lag{position:relative;height:16px;margin-top:7px;border-top:1px solid var(--rule);padding-top:6px}
+.lagline{position:absolute;left:0;right:0;top:11px;height:1px;background:var(--rule)}
+.lagfill{position:absolute;top:9px;height:5px;background:var(--model);opacity:.85;border-radius:1px}
+.lagdot{position:absolute;top:7px;width:2px;height:9px;background:var(--sig)}
+.lagmid{position:absolute;top:6px;left:50%;width:1px;height:11px;background:var(--dimmer)}
+.lagtxt{position:absolute;right:0;top:0;font-size:9px;color:var(--dim)}
+
+/* ---------- edge board ---------- */
+.mkts{display:grid;gap:10px;padding:10px}
+@media(min-width:760px){.mkts{grid-template-columns:repeat(auto-fill,minmax(330px,1fr))}}
+.mkt{border:1px solid var(--rule);border-radius:3px;background:var(--panel2);padding:10px 11px}
+.mkt.fire{border-color:#0C6B4C;box-shadow:0 0 22px -8px var(--sig)}
+.mktTop{display:flex;align-items:baseline;gap:7px}
+.mktTop .sym{font-size:12px}
+.strike{color:var(--dim);font-size:11px}
+.clock{margin-left:auto;font-size:11px;font-variant-numeric:tabular-nums}
+.clock.soon{color:var(--warn)}
+
+/* signature instrument #2: the settlement distribution strip */
+canvas.dist{width:100%;height:62px;display:block;margin:8px 0 2px}
+.rail{position:relative;height:22px;margin-bottom:6px}
+.railbg{position:absolute;left:0;right:0;top:9px;height:2px;background:var(--rule);border-radius:2px}
+.railedge{position:absolute;top:8px;height:4px;border-radius:2px}
+.mk{position:absolute;top:3px;width:1px;height:14px}
+.mk::after{position:absolute;top:-9px;left:50%;transform:translateX(-50%);font-size:8px;letter-spacing:.1em}
+.mk.mdl{background:var(--model)}.mk.mdl::after{content:'MDL';color:var(--model)}
+.mk.mkt{background:var(--sig)}.mk.mkt::after{content:'MKT';color:var(--sig)}
+
+.kv{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;font-size:10px;margin-top:6px}
+.kv div{min-width:0}
+.kv span{display:block;color:var(--dim);font-size:8.5px;letter-spacing:.1em}
+.kv b{font-weight:500;font-variant-numeric:tabular-nums}
+
+.gates{display:flex;flex-wrap:wrap;gap:3px;margin-top:8px}
+.g{font-size:8.5px;letter-spacing:.05em;padding:2px 5px;border-radius:2px;border:1px solid;cursor:default}
+.g.pass{color:var(--sig);border-color:#0C3D2C;background:#04140E}
+.g.fail{color:var(--dimmer);border-color:var(--rule)}
+.g.blocker{color:var(--loss);border-color:#3A1219;background:#150609}
+
+/* ---------- tables ---------- */
+.tbl{width:100%;border-collapse:collapse;font-size:11px}
+.tbl th{text-align:left;font-weight:400;font-size:8.5px;letter-spacing:.14em;color:var(--dim);
+  padding:7px 10px;border-bottom:1px solid var(--rule);text-transform:uppercase;white-space:nowrap}
+.tbl td{padding:8px 10px;border-bottom:1px solid var(--rule);font-variant-numeric:tabular-nums;vertical-align:top}
+.tbl tr.row{cursor:pointer}
+.tbl tr.row:hover td{background:#0E1418}
+.up{color:var(--sig)}.down{color:var(--loss)}.mut{color:var(--dim)}
+.pill{font-size:9px;padding:1px 5px;border:1px solid var(--rule);border-radius:2px;color:var(--dim)}
+.pill.yes{color:var(--sig);border-color:#0C3D2C}
+.pill.no{color:var(--warn);border-color:#4A3A14}
+.detail td{background:#080C0F;padding:11px 14px}
+.dgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(105px,1fr));gap:9px 14px;font-size:10px}
+.dgrid span{display:block;color:var(--dim);font-size:8.5px;letter-spacing:.1em}
+.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+
+.trio{display:grid;gap:14px}
+@media(min-width:900px){.trio{grid-template-columns:1.4fr 1fr 1fr}}
+canvas.eq{width:100%;height:130px;display:block}
+.bars{padding:10px 12px;display:grid;gap:7px}
+.bar{display:grid;grid-template-columns:52px 1fr 60px;gap:8px;align-items:center;font-size:10px}
+.track{height:5px;background:var(--rule);border-radius:3px;overflow:hidden;display:flex}
+.track i{display:block;height:100%}
+.track i.w{background:var(--sig)}.track i.l{background:var(--loss);opacity:.65}
+.calrow{display:grid;grid-template-columns:60px 1fr 1fr;gap:8px;align-items:center;font-size:10px}
+.calbar{height:5px;background:var(--rule);border-radius:3px;position:relative}
+.calbar i{position:absolute;top:0;left:0;height:100%;border-radius:3px}
+.calbar i.p{background:var(--model);opacity:.5}
+.calbar i.a{background:var(--sig);height:2px;top:1.5px}
+
+.logs{font-size:10px;padding:8px 12px;max-height:210px;overflow:auto;color:var(--dim)}
+.logs div{padding:1.5px 0;white-space:pre-wrap;word-break:break-word}
+.logs .warn{color:var(--warn)}.logs .error{color:var(--loss)}
+.empty{padding:26px 14px;text-align:center;color:var(--dim);font-size:11px}
+.empty b{display:block;color:var(--ink);font-family:var(--disp);font-size:12px;letter-spacing:.1em;margin-bottom:5px}
+@media(prefers-reduced-motion:no-preference){
+  .mkt.fire{animation:pulse 2.4s ease-in-out infinite}
+  @keyframes pulse{0%,100%{box-shadow:0 0 22px -10px var(--sig)}50%{box-shadow:0 0 26px -4px var(--sig)}}
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brandrow">
+    <div class="brand">0XBLAQ<small>KALSHI HOURLY ENGINE</small></div>
+    <span class="tag" id="modeTag">—</span>
+    <span class="tag" id="feedTag">ORACLE</span>
+    <span class="tag" id="redisTag">REDIS</span>
+    <div class="spacer"></div>
+    <div class="equity" id="equity">—<span>EQUITY</span></div>
+  </div>
+  <div class="betbar">
+    <label for="bet">FLAT BET</label>
+    <input type="range" id="bet" min="10" max="100" step="5" value="25" aria-label="Flat bet size in dollars" />
+    <div class="betval" id="betVal">$25</div>
+    <button id="pauseBtn">Pause</button>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="cols">
+
+    <section class="panel" id="oraclePanel">
+      <div class="phead"><h2>Oracle</h2><div class="note" id="oracleNote">index reconstruction</div></div>
+      <div id="assets"></div>
+    </section>
+
+    <section class="panel">
+      <div class="phead"><h2>Edge board</h2><div class="note" id="boardNote">—</div></div>
+      <div class="mkts" id="mkts"></div>
+    </section>
+
+  </div>
+
+  <section class="panel">
+    <div class="phead"><h2>Open</h2><div class="note" id="openNote">—</div></div>
+    <div class="scroll"><table class="tbl" id="posTbl"></table></div>
+  </section>
+
+  <div class="trio">
+    <section class="panel">
+      <div class="phead"><h2>Equity</h2><div class="note" id="eqNote">—</div></div>
+      <canvas class="eq" id="eqChart"></canvas>
+    </section>
+    <section class="panel">
+      <div class="phead"><h2>By asset</h2><div class="note">W / L / P&amp;L</div></div>
+      <div class="bars" id="assetBars"></div>
+    </section>
+    <section class="panel">
+      <div class="phead"><h2>Calibration</h2><div class="note">said vs happened</div></div>
+      <div class="bars" id="calib"></div>
+    </section>
+  </div>
+
+  <section class="panel">
+    <div class="phead"><h2>Trade log</h2><div class="note" id="tradeNote">tap a row for the full decision record</div></div>
+    <div class="scroll"><table class="tbl" id="tradeTbl"></table></div>
+  </section>
+
+  <section class="panel">
+    <div class="phead"><h2>Engine</h2><div class="note" id="engNote">—</div></div>
+    <div class="logs" id="logs"></div>
+  </section>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const money = n => (n<0?'-':'')+'$'+Math.abs(n).toFixed(2);
+const sgn = n => (n>=0?'+':'')+n.toFixed(2);
+const cls = n => n>0?'up':n<0?'down':'mut';
+const esc = s => String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const clock = s => { if(s==null) return '—'; const t=Math.max(0,Math.round(s));
+  return Math.floor(t/60)+':'+String(t%60).padStart(2,'0'); };
+const price = (p,a) => p==null?'—':'$'+p.toLocaleString(undefined,{
+  minimumFractionDigits:(a==='DOGE'||a==='XRP')?4:2, maximumFractionDigits:(a==='DOGE'||a==='XRP')?4:2});
+
+let S = null, open = new Set(), dragging = false;
+
+$('bet').addEventListener('input', e => { dragging=true; $('betVal').textContent='$'+e.target.value; });
+$('bet').addEventListener('change', async e => {
+  await fetch('/api/bet',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({usd:Number(e.target.value)})});
+  dragging=false;
+});
+$('pauseBtn').addEventListener('click', async () => {
+  const next = !(S && S.paused);
+  await fetch('/api/pause',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({paused:next})});
+});
+
+async function poll(){
+  try{
+    const r = await fetch('/api/state'); S = await r.json(); render(S);
+  }catch(e){ $('engNote').textContent = 'dashboard lost the server — retrying'; }
+  setTimeout(poll, 2000);
+}
+
+function render(s){
+  // header
+  const m=$('modeTag'); m.textContent=s.mode; m.className='tag '+(s.mode==='LIVE'?'live':'paper');
+  const alive=(s.feeds||[]).filter(f=>f.alive).length;
+  const f=$('feedTag'); f.textContent='ORACLE '+alive+'/'+(s.feeds||[]).length;
+  f.className='tag '+(alive>=2?'ok':'off');
+  const rd=$('redisTag'); rd.textContent=s.redis?'REDIS':'REDIS OFF'; rd.className='tag '+(s.redis?'ok':'off');
+  const st=s.stats;
+  $('equity').innerHTML = money(st.equity)+'<span>EQUITY &nbsp;·&nbsp; '+
+    '<i class="'+cls(st.realized)+'" style="font-style:normal">'+sgn(st.realized)+' REALISED</i></span>';
+  if(!dragging){ $('bet').value=s.bet.usd; $('betVal').textContent='$'+s.bet.usd; }
+  $('bet').min=s.bet.min; $('bet').max=s.bet.max;
+  $('pauseBtn').textContent = s.paused?'Resume':'Pause';
+  $('pauseBtn').className = s.paused?'hot':'';
+
+  renderOracle(s);
+  renderBoard(s);
+  renderPositions(s);
+  renderEquity(st);
+  renderAssets(st);
+  renderCalib(st);
+  renderTrades(s);
+  renderLogs(s);
+}
+
+/* ---------- oracle rail: price, reconstructed index, and the lag that pays ---------- */
+function renderOracle(s){
+  const rows=[];
+  for(const [a,o] of Object.entries(s.oracle||{})){
+    if(!o.composite) continue;
+    const lag=o.lagBps||0, span=25, pct=Math.max(-1,Math.min(1,lag/span));
+    const left=pct>=0?50:50+pct*50, w=Math.abs(pct)*50;
+    rows.push(`<div class="asset">
+      <div class="assetTop">
+        <div class="sym">${a}</div>
+        ${o.healthy?'':'<span class="pill">stale</span>'}
+        <div class="px">${price(o.composite,a)}</div>
+      </div>
+      <div class="sub">
+        <div>σ1m <b>${(o.sigma1mBps||0).toFixed(0)}bp</b></div>
+        <div>regime <b class="${o.volRegime>2?'down':''}">${(o.volRegime||1).toFixed(2)}×</b></div>
+        <div>flow <b class="${o.flow>0.15?'up':o.flow<-0.15?'down':''}">${((o.flow||0)*100).toFixed(0)}%</b></div>
+        <div>venues <b>${o.liveVenues}</b></div>
+      </div>
+      <div class="lag" title="reconstructed index vs venue spot">
+        <div class="lagline"></div><div class="lagmid"></div>
+        <div class="lagfill" style="left:${left}%;width:${w}%"></div>
+        <div class="lagdot" style="left:${left+(pct>=0?w:0)}%"></div>
+        <div class="lagtxt">INDEX LAG ${lag>=0?'+':''}${lag.toFixed(1)}bp</div>
+      </div>
+    </div>`);
+  }
+  $('assets').innerHTML = rows.join('') ||
+    '<div class="empty"><b>NO FEED</b>Waiting on the first venue tick.</div>';
+  $('oracleNote').textContent = (s.feeds||[]).map(x=>x.venue).join(' · ');
+}
+
+/* ---------- edge board ---------- */
+function renderBoard(s){
+  const mk=s.markets||[];
+  $('boardNote').textContent = mk.length
+    ? mk.length+' live · scan '+s.lastScanMs+'ms'
+    : (s.running?'scanning':'engine idle');
+
+  if(!mk.length){
+    $('mkts').innerHTML = '<div class="empty"><b>NOTHING IN RANGE</b>'+
+      (s.running?'No hourly market is inside the time and moneyness gates right now.'
+                :'Engine is not running — check the log below.')+'</div>';
+    return;
+  }
+
+  $('mkts').innerHTML = mk.slice(0,12).map((m,i)=>{
+    const c=m.candidate, fv=m.fv, b=m.book||{};
+    const mdl = fv? (c&&c.side==='no'? (1-fv.p) : fv.p) : null;
+    const mktP = c? c.price/100 : (b.mid!=null? b.mid/100 : null);
+    const edge = c? c.net : null;
+    const strike = m.capStrike!=null && m.floorStrike!=null
+      ? price(m.floorStrike,m.asset)+'–'+price(m.capStrike,m.asset)
+      : m.floorStrike!=null ? '> '+price(m.floorStrike,m.asset)
+      : '< '+price(m.capStrike,m.asset);
+    const blockers=(m.gates||[]).filter(g=>!g.pass);
+    return `<div class="mkt ${m.fire?'fire':''}">
+      <div class="mktTop">
+        <div class="sym">${m.asset}</div>
+        <div class="strike">${strike}</div>
+        <div class="clock ${m.tau<180?'soon':''}">${clock(m.tau)}</div>
+      </div>
+      <canvas class="dist" id="d${i}"></canvas>
+      <div class="rail">
+        <div class="railbg"></div>
+        ${(mdl!=null&&mktP!=null)?`<div class="railedge" style="left:${Math.min(mdl,mktP)*100}%;
+          width:${Math.abs(mdl-mktP)*100}%;background:${edge>=0?'var(--sig)':'var(--loss)'};opacity:.4"></div>`:''}
+        ${mktP!=null?`<div class="mk mkt" style="left:${mktP*100}%"></div>`:''}
+        ${mdl!=null?`<div class="mk mdl" style="left:${mdl*100}%"></div>`:''}
+      </div>
+      <div class="kv">
+        <div><span>SIDE</span><b class="${c?(c.side==='yes'?'up':''):'mut'}">${c?c.side.toUpperCase():'—'}</b></div>
+        <div><span>ASK</span><b>${c?c.price+'¢':'—'}</b></div>
+        <div><span>FAIR</span><b style="color:var(--model)">${mdl!=null?(mdl*100).toFixed(1)+'¢':'—'}</b></div>
+        <div><span>NET EDGE</span><b class="${edge>0?'up':edge<0?'down':'mut'}">${edge!=null?edge.toFixed(1)+'¢':'—'}</b></div>
+        <div><span>Z</span><b>${fv?fv.z.toFixed(2):'—'}</b></div>
+        <div><span>σ EFF</span><b>${fv?fv.sigmaEffBps.toFixed(0)+'bp':'—'}</b></div>
+        <div><span>DRIFT</span><b style="color:var(--model)">${fv?(fv.driftBps>=0?'+':'')+fv.driftBps.toFixed(1)+'bp':'—'}</b></div>
+        <div><span>SPREAD</span><b>${b.spread!=null?b.spread+'¢':'—'}</b></div>
+      </div>
+      <div class="gates">${(m.gates||[]).map(g=>
+        `<span class="g ${g.pass?'pass':(blockers.length<=2?'blocker':'fail')}" title="${esc(g.detail||'')}"
+        >${esc(g.name)} ${esc(g.value)}</span>`).join('')}</div>
+    </div>`;
+  }).join('');
+
+  mk.slice(0,12).forEach((m,i)=>drawDist($('d'+i), m));
+}
+
+/* Signature: the modelled distribution of the settlement value, with the strike
+   cut in. The shaded area IS the model's probability — you can see the trade. */
+function drawDist(cv, m){
+  if(!cv || !m.fv) return;
+  const dpr=window.devicePixelRatio||1, w=cv.clientWidth, h=cv.clientHeight;
+  cv.width=w*dpr; cv.height=h*dpr;
+  const x=cv.getContext('2d'); x.scale(dpr,dpr); x.clearRect(0,0,w,h);
+
+  const {centre,sigmaEff}=m.fv;
+  const lo=Math.log(centre)-3.4*sigmaEff, hi=Math.log(centre)+3.4*sigmaEff;
+  const toX=l=>((l-lo)/(hi-lo))*w;
+  const N=140, pts=[];
+  for(let i=0;i<=N;i++){
+    const l=lo+(hi-lo)*(i/N), z=(l-Math.log(centre))/sigmaEff;
+    pts.push([toX(l), Math.exp(-0.5*z*z)]);
+  }
+  const top=8, bot=h-11, hgt=bot-top;
+  const yOf=d=>bot-d*hgt;
+
+  const kLo=m.floorStrike!=null?toX(Math.log(m.floorStrike)):-1e6;
+  const kHi=m.capStrike!=null?toX(Math.log(m.capStrike)):1e6;
+
+  // win region under the curve
+  x.beginPath(); x.moveTo(Math.max(0,Math.min(w,kLo)),bot);
+  for(const [px,d] of pts) if(px>=kLo&&px<=kHi) x.lineTo(px,yOf(d));
+  x.lineTo(Math.max(0,Math.min(w,kHi)),bot); x.closePath();
+  const g=x.createLinearGradient(0,top,0,bot);
+  g.addColorStop(0,'rgba(155,123,255,.34)'); g.addColorStop(1,'rgba(155,123,255,.04)');
+  x.fillStyle=g; x.fill();
+
+  // full density outline
+  x.beginPath(); pts.forEach(([px,d],i)=>i?x.lineTo(px,yOf(d)):x.moveTo(px,yOf(d)));
+  x.strokeStyle='rgba(155,123,255,.85)'; x.lineWidth=1.25; x.stroke();
+
+  // baseline
+  x.beginPath(); x.moveTo(0,bot); x.lineTo(w,bot);
+  x.strokeStyle='#161E23'; x.lineWidth=1; x.stroke();
+
+  // strike cuts
+  x.setLineDash([2,3]); x.strokeStyle='#FFC24D'; x.lineWidth=1;
+  for(const k of [kLo,kHi]) if(k>0&&k<w){ x.beginPath(); x.moveTo(k,top-4); x.lineTo(k,bot); x.stroke(); }
+  x.setLineDash([]);
+
+  // where spot is now, and where the settlement index currently sits
+  const marks=[[m.fv.spot,'#00F0A0'],[m.fv.index,'#64757A']];
+  for(const [v,col] of marks){
+    if(!(v>0)) continue;
+    const px=toX(Math.log(v)); if(px<0||px>w) continue;
+    x.fillStyle=col; x.fillRect(px-.5,bot-3,1,6);
+  }
+  x.font='8px IBM Plex Mono'; x.fillStyle='#3B474C';
+  x.fillText('SETTLEMENT DISTRIBUTION', 1, h-1);
+}
+
+/* ---------- open positions ---------- */
+function renderPositions(s){
+  const ps=s.positions||[];
+  $('openNote').textContent = ps.length? ps.length+' position'+(ps.length>1?'s':'')+' · '+
+    money(s.stats.deployed)+' deployed' : 'flat';
+  if(!ps.length){ $('posTbl').innerHTML=
+    '<tr><td class="empty"><b>FLAT</b>No open contracts. The board above is what the engine is watching.</td></tr>';
+    return; }
+  $('posTbl').innerHTML =
+    '<thead><tr><th>Mkt</th><th>Side</th><th>Qty</th><th>Entry</th><th>Mark</th><th>Unreal</th><th>Edge in</th><th>Close</th></tr></thead><tbody>'+
+    ps.map(p=>{
+      const tau=(Date.parse(p.closeTime)-s.now)/1000;
+      return `<tr class="row" data-k="p:${esc(p.ticker)}">
+        <td>${p.asset}<div class="mut" style="font-size:9px">${strikeTxt(p)}</div></td>
+        <td><span class="pill ${p.side}">${p.side.toUpperCase()}</span></td>
+        <td>${p.contracts}</td><td>${p.entryPrice}¢</td>
+        <td>${p.markPrice}¢</td>
+        <td class="${cls(p.unrealizedUsd||0)}">${sgn(p.unrealizedUsd||0)}</td>
+        <td class="up">${p.edgeCents.toFixed(1)}¢</td>
+        <td class="${tau<180?'down':''}">${clock(tau)}</td></tr>`+detailRow('p:'+p.ticker,p,8);
+    }).join('')+'</tbody>';
+  wire();
+}
+const strikeTxt = p => p.capStrike!=null&&p.floorStrike!=null
+  ? price(p.floorStrike,p.asset)+'–'+price(p.capStrike,p.asset)
+  : p.floorStrike!=null ? '> '+price(p.floorStrike,p.asset) : '< '+price(p.capStrike,p.asset);
+
+/* ---------- the full decision record ---------- */
+function detailRow(key,t,span){
+  if(!open.has(key)) return '';
+  const fv=t.fv||{};
+  const cell=(l,v)=>`<div><span>${l}</span>${v}</div>`;
+  return `<tr class="detail"><td colspan="${span}">
+    <div class="dgrid">
+      ${cell('TICKER',esc(t.ticker))}
+      ${cell('MODEL P',(t.modelP*100).toFixed(1)+'%')}
+      ${cell('GAUSSIAN',fv.pGauss!=null?(fv.pGauss*100).toFixed(1)+'%':'—')}
+      ${cell('BOOTSTRAP',fv.pEmp!=null?(fv.pEmp*100).toFixed(1)+'% <span style="color:var(--dim)">n='+fv.empN+'</span>':'n/a')}
+      ${cell('Z',fv.z!=null?fv.z.toFixed(3):'—')}
+      ${cell('σ EFF',fv.sigmaEffBps!=null?fv.sigmaEffBps.toFixed(1)+'bp':'—')}
+      ${cell('SPOT',price(fv.spot,t.asset))}
+      ${cell('INDEX',price(fv.index,t.asset))}
+      ${cell('CENTRE',price(fv.centre,t.asset))}
+      ${cell('INDEX LAG',fv.lagBps!=null?fv.lagBps.toFixed(1)+'bp':'—')}
+      ${cell('DRIFT USED',fv.driftBps!=null?fv.driftBps.toFixed(1)+'bp':'—')}
+      ${cell('FLOW TILT',fv.tiltBps!=null?fv.tiltBps.toFixed(1)+'bp':'—')}
+      ${cell('STAKE',money(t.costUsd))}
+      ${cell('ENTRY FEE',money(t.feeUsd||0))}
+      ${cell('EDGE AT ENTRY',t.edgeCents.toFixed(2)+'¢')}
+      ${t.exitReason?cell('EXIT',esc(t.exitReason)):''}
+      ${t.holdSec!=null?cell('HELD',clock(t.holdSec)):''}
+      ${t.roiPct!=null?cell('ROI','<span class="'+cls(t.roiPct)+'">'+t.roiPct.toFixed(1)+'%</span>'):''}
+    </div>
+    <div class="gates" style="margin-top:10px">${(t.gates||[]).map(g=>
+      `<span class="g ${g.pass?'pass':'fail'}" title="${esc(g.detail||'')}">${esc(g.name)} ${esc(g.value)}</span>`
+    ).join('')}</div></td></tr>`;
+}
+
+function wire(){
+  document.querySelectorAll('tr.row').forEach(tr=>{
+    tr.onclick=()=>{ const k=tr.dataset.k; open.has(k)?open.delete(k):open.add(k); render(S); };
+  });
+}
+
+/* ---------- charts ---------- */
+function renderEquity(st){
+  const cv=$('eqChart'), pts=(st.equityCurve||[]).map(p=>p.equity);
+  $('eqNote').textContent = st.trades? st.trades+' closed · '+st.winRate.toFixed(0)+'% win · ROI '+st.roiPct.toFixed(1)+'%' : 'no closed trades yet';
+  const dpr=window.devicePixelRatio||1, w=cv.clientWidth, h=cv.clientHeight;
+  cv.width=w*dpr; cv.height=h*dpr; const x=cv.getContext('2d'); x.scale(dpr,dpr); x.clearRect(0,0,w,h);
+  if(pts.length<2){ x.font='10px IBM Plex Mono'; x.fillStyle='#3B474C';
+    x.fillText('equity curve draws after the first close',10,h/2); return; }
+  const lo=Math.min(...pts), hi=Math.max(...pts), pad=(hi-lo)*.15||1;
+  const X=i=>(i/(pts.length-1))*(w-8)+4, Y=v=>h-8-((v-lo+pad)/((hi-lo)+pad*2))*(h-16);
+  x.beginPath(); pts.forEach((v,i)=>i?x.lineTo(X(i),Y(v)):x.moveTo(X(i),Y(v)));
+  const rising=pts[pts.length-1]>=pts[0];
+  x.strokeStyle=rising?'#00F0A0':'#FF4F6D'; x.lineWidth=1.5; x.stroke();
+  x.lineTo(X(pts.length-1),h); x.lineTo(X(0),h); x.closePath();
+  const g=x.createLinearGradient(0,0,0,h);
+  g.addColorStop(0,rising?'rgba(0,240,160,.20)':'rgba(255,79,109,.18)');
+  g.addColorStop(1,'transparent'); x.fillStyle=g; x.fill();
+}
+
+function renderAssets(st){
+  const e=Object.entries(st.byAsset||{});
+  $('assetBars').innerHTML = e.length? e.map(([a,v])=>{
+    const tot=v.w+v.l||1;
+    return `<div class="bar"><div>${a}</div>
+      <div class="track"><i class="w" style="width:${v.w/tot*100}%"></i><i class="l" style="width:${v.l/tot*100}%"></i></div>
+      <div style="text-align:right" class="${cls(v.pnl)}">${sgn(v.pnl)}</div></div>`;
+  }).join('') : '<div class="empty">Splits appear once trades settle.</div>';
+}
+
+function renderCalib(st){
+  const c=(st.calibration||[]).filter(r=>r.n>0);
+  $('calib').innerHTML = c.length? c.map(r=>
+    `<div class="calrow"><div class="mut">${r.bucket}</div>
+      <div class="calbar"><i class="p" style="width:${r.predicted}%"></i><i class="a" style="width:${r.actual}%"></i></div>
+      <div style="text-align:right">${r.actual.toFixed(0)}% <span class="mut">n${r.n}</span></div></div>`
+  ).join('') : '<div class="empty">The ledger fills as contracts settle. Violet is what the model said, green is what happened.</div>';
+}
+
+function renderTrades(s){
+  const t=s.trades||[];
+  if(!t.length){ $('tradeTbl').innerHTML=
+    '<tr><td class="empty"><b>NO HISTORY</b>Closed trades land here with every gate reading from entry.</td></tr>'; return; }
+  $('tradeTbl').innerHTML =
+    '<thead><tr><th>Time</th><th>Mkt</th><th>Side</th><th>In</th><th>Out</th><th>Qty</th><th>P&amp;L</th><th>ROI</th><th>Why</th></tr></thead><tbody>'+
+    t.map(x=>`<tr class="row" data-k="t:${esc(x.id)}">
+      <td class="mut">${new Date(x.closedAt).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</td>
+      <td>${x.asset}<div class="mut" style="font-size:9px">${strikeTxt(x)}</div></td>
+      <td><span class="pill ${x.side}">${x.side.toUpperCase()}</span></td>
+      <td>${x.entryPrice}¢</td><td>${x.exitPrice}¢</td><td>${x.contracts}</td>
+      <td class="${cls(x.pnlUsd)}">${sgn(x.pnlUsd)}</td>
+      <td class="${cls(x.roiPct)}">${x.roiPct.toFixed(0)}%</td>
+      <td class="mut">${esc(x.exitReason)}</td></tr>`+detailRow('t:'+x.id,x,9)).join('')+'</tbody>';
+  wire();
+}
+
+function renderLogs(s){
+  $('engNote').textContent = `scans ${s.scans} · api ${s.apiCalls} (${s.apiErrors} err) · up ${clock(s.uptimeSec)}`;
+  $('logs').innerHTML=(s.logs||[]).map(l=>
+    `<div class="${l.level}">${new Date(l.t).toLocaleTimeString([], {hour12:false})}  ${esc(l.msg)}</div>`).join('');
+}
+
+poll();
+window.addEventListener('resize',()=>{ if(S) render(S); });
+</script>
+</body>
+</html>
