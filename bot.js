@@ -1,8 +1,7 @@
 'use strict';
 /**
  * 0XBLAQ · KALSHI ENGINE — single-file build
- * Hourly and quarter-hour crypto binaries. Ten modules in separate scopes via a
- * small inline registry. Search `=== module: name ===` to jump around.
+ * Hourly and quarter-hour crypto binaries. Search `=== module: name ===`.
  */
 
 const __registry = {};
@@ -16,7 +15,7 @@ function __req(name) {
   return m.exports;
 }
 
-// ═══ module: config ══════════════════════════════════
+// ═══ module: config ═══════════════════════════════
 __def('config', (module, exports) => {
   const num = (v, d) => (v === undefined || v === '' || isNaN(Number(v)) ? d : Number(v));
   const bool = (v, d) => (v === undefined || v === '' ? d : String(v).toLowerCase() === 'true');
@@ -90,9 +89,16 @@ __def('config', (module, exports) => {
     MIN_ABS_Z: num(process.env.MIN_ABS_Z, 0.0),
     MIN_PRICE_CENTS: num(process.env.MIN_PRICE_CENTS, 8),
     MAX_PRICE_CENTS: num(process.env.MAX_PRICE_CENTS, 92),
+    VOL_BASELINE_WARMUP_S: num(process.env.VOL_BASELINE_WARMUP_S, 1800),
     VOL_REGIME_LOW: num(process.env.VOL_REGIME_LOW, 0.35),
     VOL_REGIME_HIGH: num(process.env.VOL_REGIME_HIGH, 2.8),
     MAX_MODEL_DISAGREE: num(process.env.MAX_MODEL_DISAGREE, 0.14),
+
+    // Calibration mode: deliberately loosens the money gates so the bot actually
+    // transacts and produces execution data. It is NOT a profitable configuration
+    // and should never be used with real money — it exists to answer "does the
+    // order path work and is the model calibrated", not "does this make money".
+    CALIBRATION_MODE: bool(process.env.CALIBRATION_MODE, false),
     FLOW_VETO: num(process.env.FLOW_VETO, 0.72),             // |flow| above this vetoes fades
 
     // ---------- sizing & risk ----------
@@ -152,7 +158,7 @@ __def('config', (module, exports) => {
   module.exports = CFG;
 });
 
-// ═══ module: log ══════════════════════════════════
+// ═══ module: log ═══════════════════════════════
 __def('log', (module, exports) => {
   const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
   const min = LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] || 20;
@@ -180,7 +186,7 @@ __def('log', (module, exports) => {
   };
 });
 
-// ═══ module: store ══════════════════════════════════
+// ═══ module: store ═══════════════════════════════
 __def('store', (module, exports) => {
   const CFG = __req('config');
 
@@ -297,7 +303,7 @@ __def('store', (module, exports) => {
   module.exports = store;
 });
 
-// ═══ module: kalshi ══════════════════════════════════
+// ═══ module: kalshi ═══════════════════════════════
 __def('kalshi', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -455,7 +461,7 @@ __def('kalshi', (module, exports) => {
   module.exports = kalshi;
 });
 
-// ═══ module: pricing ══════════════════════════════════
+// ═══ module: pricing ═══════════════════════════════
 __def('pricing', (module, exports) => {
   const CFG = __req('config');
 
@@ -601,7 +607,7 @@ __def('pricing', (module, exports) => {
   module.exports = { fairValue, feeCents, Phi, settleVarMultiplier };
 });
 
-// ═══ module: oracle ══════════════════════════════════
+// ═══ module: oracle ═══════════════════════════════
 __def('oracle', (module, exports) => {
   const WebSocket = require('ws');
   const CFG = __req('config');
@@ -732,10 +738,14 @@ __def('oracle', (module, exports) => {
         const floor = Math.pow(CFG.VOL_FLOOR_BPS_PER_ROOT_S / 10000, 2);
         this.sigma = Math.sqrt(Math.max(blended, floor));
 
-        const ab = 1 - decay(6 * 3600, 1);
+        // Warm the baseline fast at first, then settle to a 6h memory. A cold EWMA
+        // seeded from one print makes the regime ratio meaningless for hours.
+        const warm = this.ringLen < CFG.VOL_BASELINE_WARMUP_S;
+        const ab = 1 - decay(warm ? 300 : 6 * 3600, 1);
         this.sigmaBaseline = this.sigmaBaseline === 0
           ? this.sigma
           : this.sigmaBaseline + ab * (this.sigma - this.sigmaBaseline);
+        this.baselineReady = this.ringLen >= CFG.VOL_BASELINE_WARMUP_S;
       }
 
       this.idxRing.push(this.index);
@@ -799,6 +809,7 @@ __def('oracle', (module, exports) => {
         sigma: this.sigma,
         sigmaBaseline: this.sigmaBaseline,
         volRegime: this.sigmaBaseline > 0 ? this.sigma / this.sigmaBaseline : 1,
+        baselineReady: !!this.baselineReady,
         sigma1mBps: this.sigma * Math.sqrt(60) * 10000,
         flow: this.flow,
         historySec: this.ringLen,
@@ -929,7 +940,7 @@ __def('oracle', (module, exports) => {
   };
 });
 
-// ═══ module: portfolio ══════════════════════════════════
+// ═══ module: portfolio ═══════════════════════════════
 __def('portfolio', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -1148,7 +1159,7 @@ __def('portfolio', (module, exports) => {
   };
 });
 
-// ═══ module: strategy ══════════════════════════════════
+// ═══ module: strategy ═══════════════════════════════
 __def('strategy', (module, exports) => {
   const CFG = __req('config');
   const { fairValue, feeCents } = __req('pricing');
@@ -1161,17 +1172,20 @@ __def('strategy', (module, exports) => {
    */
 
   /** Per-frequency tuning. The model is identical; only the clock changes. */
+  const CAL = CFG.CALIBRATION_MODE;
   const FREQ = {
     hourly: {
       key: 'hourly', label: '1H',
       minSec: CFG.MIN_SECONDS_TO_CLOSE, maxSec: CFG.MAX_SECONDS_TO_CLOSE,
-      minEdge: CFG.MIN_EDGE_CENTS, maxSpread: CFG.MAX_SPREAD_CENTS,
+      minEdge: CAL ? 1.0 : CFG.MIN_EDGE_CENTS,
+      maxSpread: CAL ? 12 : CFG.MAX_SPREAD_CENTS,
       settleWindow: CFG.SETTLE_WINDOW_S,
     },
     m15: {
       key: 'm15', label: '15M',
       minSec: CFG.MIN_SECONDS_15M, maxSec: CFG.MAX_SECONDS_15M,
-      minEdge: CFG.MIN_EDGE_CENTS_15M, maxSpread: CFG.MAX_SPREAD_CENTS_15M,
+      minEdge: CAL ? 1.0 : CFG.MIN_EDGE_CENTS_15M,
+      maxSpread: CAL ? 12 : CFG.MAX_SPREAD_CENTS_15M,
       settleWindow: CFG.SETTLE_WINDOW_15M,
     },
   };
@@ -1252,9 +1266,9 @@ __def('strategy', (module, exports) => {
 
     const regime = o.sigmaBaseline > 0 ? o.sigma / o.sigmaBaseline : 1;
     const okRegime = G('vol regime',
-      regime >= CFG.VOL_REGIME_LOW && regime <= CFG.VOL_REGIME_HIGH,
-      `${regime.toFixed(2)}x`,
-      'vol shocks break the Gaussian core; sit them out');
+      !o.baselineReady || (regime >= CFG.VOL_REGIME_LOW && regime <= CFG.VOL_REGIME_HIGH),
+      o.baselineReady ? `${regime.toFixed(2)}x` : 'warming',
+      'vol shocks break the Gaussian core; held open until the baseline is real');
 
     if (!fv) {
       G('model', false, 'no fair value', 'oracle history too thin');
@@ -1303,7 +1317,7 @@ __def('strategy', (module, exports) => {
     }
 
     const okDepth = G('depth',
-      best.depth >= Math.min(CFG.MIN_BOOK_DEPTH, best.contracts),
+      best.depth >= Math.min(CAL ? 1 : CFG.MIN_BOOK_DEPTH, best.contracts),
       `${best.depth} @ touch`,
       'need real size at the touch, not a one-lot');
 
@@ -1351,7 +1365,7 @@ __def('strategy', (module, exports) => {
   module.exports = { evaluate, readBook, contractsFor, sizeUsd, FREQ };
 });
 
-// ═══ module: engine ══════════════════════════════════
+// ═══ module: engine ═══════════════════════════════
 __def('engine', (module, exports) => {
   const CFG = __req('config');
   const log = __req('log');
@@ -1421,6 +1435,10 @@ __def('engine', (module, exports) => {
   const runtime = {
     betUsd: CFG.BET_USD,
     slots: Math.max(CFG.SLOTS_MIN, Math.min(CFG.SLOTS_MAX, CFG.SLOTS)),
+    drops: {},
+    dropTotal: 0,
+    rawSamples: {},
+    discovered: 0,
     running: false,
     paused: false,
     startedAt: Date.now(),
@@ -1470,6 +1488,21 @@ __def('engine', (module, exports) => {
       }
     }
     marketCache = out;
+    runtime.discovered = out.length;
+    runtime.rawSamples = {};
+    for (const m of out) {
+      const k = `${m._series}`;
+      if (!runtime.rawSamples[k]) {
+        runtime.rawSamples[k] = {
+          ticker: m.ticker, status: m.status, close_time: m.close_time,
+          floor_strike: m.floor_strike ?? null, cap_strike: m.cap_strike ?? null,
+          strike_type: m.strike_type ?? null,
+          yes_bid: m.yes_bid, yes_ask: m.yes_ask, volume: m.volume,
+          liquidity: m.liquidity, open_interest: m.open_interest,
+          keys: Object.keys(m).filter(x => !x.startsWith('_')),
+        };
+      }
+    }
     lastDiscovery = Date.now();
     log.debug(`discovery: ${out.length} open hourly markets`);
   }
@@ -1479,24 +1512,36 @@ __def('engine', (module, exports) => {
    * limit for nothing — everything more than ~3 sigma out is untradeable by
    * construction. Prefilter on modelled moneyness, then fetch only what's live.
    */
+  /**
+   * Anything dropped here never reaches the gates, so it never reaches the
+   * rejection ledger either — it just vanishes. That is the worst possible
+   * failure mode to debug, so every drop is now counted and named.
+   */
   function prefilter(markets) {
     const picked = [];
+    const drop = { noOracle: 0, outOfTime: 0, noStrike: 0, noModel: 0, tooFar: 0, capped: 0 };
+
     for (const m of markets) {
       const o = oracle.get(m._asset);
-      if (!o || !(o.composite > 0) || !(o.sigma > 0)) continue;
+      if (!o || !(o.composite > 0) || !(o.sigma > 0)) { drop.noOracle += 1; continue; }
       const F = m._freq || FREQ.hourly;
       const tau = (Date.parse(m.close_time) - Date.now()) / 1000;
-      if (tau < F.minSec || tau > F.maxSec) continue;
+      if (tau < F.minSec || tau > F.maxSec) { drop.outOfTime += 1; continue; }
+
+      const K = strikesOf(m);
+      if (K.floor == null && K.cap == null) { drop.noStrike += 1; continue; }
+
       const fv = fairValue(o, {
-        floorStrike: m.floor_strike ?? null,
-        capStrike: m.cap_strike ?? null,
-        settleWindow: F.settleWindow,
-        tau,
+        floorStrike: K.floor, capStrike: K.cap,
+        settleWindow: F.settleWindow, tau,
       });
-      if (!fv) continue;
-      if (Math.abs(fv.z) > CFG.MAX_ABS_Z + 0.8) continue;
+      if (!fv) { drop.noModel += 1; continue; }
+      if (Math.abs(fv.z) > CFG.MAX_ABS_Z + 0.8) { drop.tooFar += 1; continue; }
+      m._strikes = K;
       picked.push({ m, z: Math.abs(fv.z) });
     }
+    runtime.drops = drop;
+    runtime.dropTotal = Object.values(drop).reduce((a, b) => a + b, 0);
     picked.sort((a, b) => a.z - b.z);
     // at most 4 strikes per asset per close
     const perKey = {};
@@ -1504,9 +1549,29 @@ __def('engine', (module, exports) => {
     for (const p of picked) {
       const key = `${p.m._asset}|${p.m._freq.key}|${p.m.close_time}`;
       perKey[key] = (perKey[key] || 0) + 1;
-      if (perKey[key] <= 4) out.push(p.m);
+      if (perKey[key] <= 4) out.push(p.m); else drop.capped += 1;
     }
+    runtime.dropTotal = Object.values(drop).reduce((a, b) => a + b, 0);
     return out;
+  }
+
+  /**
+   * Kalshi expresses thresholds differently across families. Read the documented
+   * fields first, then fall back to anything numeric the market record carries,
+   * so a renamed field degrades into a log line instead of silent nothing.
+   */
+  function strikesOf(m) {
+    let floor = m.floor_strike ?? null;
+    let cap = m.cap_strike ?? null;
+    if (floor == null && cap == null) {
+      const st = String(m.strike_type || '').toLowerCase();
+      const v = m.strike_value ?? m.threshold ?? m.cap_strike ?? m.floor_strike ?? null;
+      if (v != null && Number.isFinite(Number(v))) {
+        if (st.includes('less') || st.includes('below')) cap = Number(v);
+        else floor = Number(v);
+      }
+    }
+    return { floor, cap, source: (m.floor_strike ?? m.cap_strike) != null ? 'documented' : 'fallback' };
   }
 
   // --------------------------------------------------------------- order firing
@@ -1527,8 +1592,8 @@ __def('engine', (module, exports) => {
       freq: (m._freq || FREQ.hourly).key,
       freqLabel: (m._freq || FREQ.hourly).label,
       settleWindow: (m._freq || FREQ.hourly).settleWindow,
-      floorStrike: m.floor_strike ?? null,
-      capStrike: m.cap_strike ?? null,
+      floorStrike: m._strikes?.floor ?? m.floor_strike ?? null,
+      capStrike: m._strikes?.cap ?? m.cap_strike ?? null,
       modelP: c.modelP,
       edgeCents: c.net,
       gates: decision.gates,
@@ -1715,7 +1780,9 @@ __def('engine', (module, exports) => {
       runtime.candidatesSeen += 1;
 
       const decision = evaluate({
-        market: m, ob, o, asset: m._asset, freq: m._freq,
+        market: { ...m, floor_strike: m._strikes?.floor ?? m.floor_strike,
+                  cap_strike: m._strikes?.cap ?? m.cap_strike },
+        ob, o, asset: m._asset, freq: m._freq,
         betUsd: runtime.betUsd,
         maxSlots: runtime.slots,
         exposure: pf.exposure(),
@@ -1728,8 +1795,8 @@ __def('engine', (module, exports) => {
         asset: m._asset,
         freq: (m._freq || FREQ.hourly).label,
         title: m.yes_sub_title || m.subtitle || m.title || m.ticker,
-        floorStrike: m.floor_strike ?? null,
-        capStrike: m.cap_strike ?? null,
+        floorStrike: m._strikes?.floor ?? m.floor_strike ?? null,
+        capStrike: m._strikes?.cap ?? m.cap_strike ?? null,
         closeTime: m.close_time,
         tau: decision.tau,
         book: decision.book,
@@ -1828,7 +1895,7 @@ __def('engine', (module, exports) => {
   module.exports = { start, runtime, setBet, setSlots, tick, discover, rejectSummary };
 });
 
-// ═══ server ════════════════════════════════════
+// ═══ server ════════════════════════════════
 const path = require('path');
 const express = require('express');
 const CFG = __req('config');
@@ -1888,6 +1955,14 @@ app.get('/api/state', (req, res) => {
     series: engine.runtime.series,
     markets: engine.runtime.markets,
     rejects: engine.rejectSummary(),
+    funnel: {
+      discovered: engine.runtime.discovered,
+      dropped: engine.runtime.dropTotal,
+      drops: engine.runtime.drops,
+      evaluated: (engine.runtime.markets || []).length,
+    },
+    rawSamples: engine.runtime.rawSamples,
+    calibrationMode: CFG.CALIBRATION_MODE,
     positions: pf.positions(),
     trades: pf.trades(60),
     stats: pf.stats(),
