@@ -15,7 +15,7 @@ function __req(name) {
   return m.exports;
 }
 
-// ═══ module: config ═══════════════════
+// ═══ module: config ══════════════════
 __def('config', (module, exports) => {
   const num = (v, d) => (v === undefined || v === '' || isNaN(Number(v)) ? d : Number(v));
   const bool = (v, d) => (v === undefined || v === '' ? d : String(v).toLowerCase() === 'true');
@@ -31,6 +31,8 @@ __def('config', (module, exports) => {
     PAPER_MODE: bool(process.env.PAPER_MODE, true),
     LOG_LEVEL: str(process.env.LOG_LEVEL, 'info'),
     ENGINE_TICK_MS: num(process.env.ENGINE_TICK_MS, 2000),
+    // How often the engine writes a full "why nothing fired" line to the LOG.
+    HEARTBEAT_SCANS: num(process.env.HEARTBEAT_SCANS, 15),
 
     // ---------- kalshi ----------
     // prod: https://api.elections.kalshi.com/trade-api/v2
@@ -201,7 +203,7 @@ __def('config', (module, exports) => {
   module.exports = CFG;
 });
 
-// ═══ module: log ═══════════════════
+// ═══ module: log ══════════════════
 __def('log', (module, exports) => {
   const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
   const min = LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] || 20;
@@ -229,7 +231,7 @@ __def('log', (module, exports) => {
   };
 });
 
-// ═══ module: store ═══════════════════
+// ═══ module: store ══════════════════
 __def('store', (module, exports) => {
   const CFG = __req('config');
 
@@ -346,7 +348,7 @@ __def('store', (module, exports) => {
   module.exports = store;
 });
 
-// ═══ module: kalshi ═══════════════════
+// ═══ module: kalshi ══════════════════
 __def('kalshi', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -524,7 +526,7 @@ __def('kalshi', (module, exports) => {
   module.exports = kalshi;
 });
 
-// ═══ module: pricing ═══════════════════
+// ═══ module: pricing ══════════════════
 __def('pricing', (module, exports) => {
   const CFG = __req('config');
 
@@ -670,7 +672,7 @@ __def('pricing', (module, exports) => {
   module.exports = { fairValue, feeCents, Phi, settleVarMultiplier };
 });
 
-// ═══ module: oracle ═══════════════════
+// ═══ module: oracle ══════════════════
 __def('oracle', (module, exports) => {
   const WebSocket = require('ws');
   const CFG = __req('config');
@@ -1003,7 +1005,7 @@ __def('oracle', (module, exports) => {
   };
 });
 
-// ═══ module: portfolio ═══════════════════
+// ═══ module: portfolio ══════════════════
 __def('portfolio', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -1250,7 +1252,7 @@ __def('portfolio', (module, exports) => {
   };
 });
 
-// ═══ module: strategy ═══════════════════
+// ═══ module: strategy ══════════════════
 __def('strategy', (module, exports) => {
   const CFG = __req('config');
   const { fairValue, feeCents } = __req('pricing');
@@ -1553,7 +1555,7 @@ __def('strategy', (module, exports) => {
   module.exports = { evaluate, readBook, contractsFor, sizeUsd, FREQ };
 });
 
-// ═══ module: engine ═══════════════════
+// ═══ module: engine ══════════════════
 __def('engine', (module, exports) => {
   const CFG = __req('config');
   const log = __req('log');
@@ -1807,6 +1809,7 @@ __def('engine', (module, exports) => {
 
   // --------------------------------------------------------------- order firing
 
+  const BUILD = '2026-07-30-failopen-heartbeat';
   const orderCooldown = new Map();
 
   async function fire(m, decision) {
@@ -2204,6 +2207,46 @@ __def('engine', (module, exports) => {
     runtime.markets = view;
     runtime.lastScanAt = Date.now();
     runtime.lastScanMs = Date.now() - t0;
+
+    heartbeat(view);
+  }
+
+  /**
+   * Every diagnostic used to live on the dashboard, which meant a log alone could
+   * never explain a silent bot. This puts the same answer in the log: how many
+   * candidates were evaluated, which gates killed them, and what the top candidate
+   * was missing. Emitted every HEARTBEAT_SCANS scans, and immediately whenever the
+   * engine goes from trading to not trading.
+   */
+  function heartbeat(view) {
+    runtime.sinceHeartbeat = (runtime.sinceHeartbeat || 0) + 1;
+    if (runtime.sinceHeartbeat < CFG.HEARTBEAT_SCANS) return;
+    runtime.sinceHeartbeat = 0;
+
+    const open = pf.positions().length;
+    const pending = runtime.pending.size;
+    const r = rejectSummary();
+
+    if (!view.length) {
+      log.info(`heartbeat: 0 candidates reached the gates `
+        + `(${runtime.discovered} discovered, ${runtime.dropTotal} dropped: `
+        + `${Object.entries(runtime.drops || {}).filter(([, v]) => v > 0)
+             .map(([k, v]) => `${v} ${k}`).join(', ') || 'none'})`);
+      return;
+    }
+
+    const fails = (r.gates || []).slice(0, 4)
+      .map(g => `${g.name} ${g.failed}/${r.evaluated}${g.sole ? ` (${g.sole} sole)` : ''} [${g.lastValue}]`);
+    const best = view.find(v => v.candidate);
+    const bestTxt = best && best.candidate
+      ? `best: ${best.asset} ${best.freq} ${best.candidate.side} @${best.candidate.price}c `
+        + `p=${(best.candidate.modelP * 100).toFixed(0)}% net=${best.candidate.net.toFixed(1)}c`
+      : 'no fillable candidate on any market';
+
+    log.info(`heartbeat: ${view.length} candidates, ${r.fired} fired, ${open} open, ${pending} resting`
+      + ` | bal ${runtime.balanceUsd == null ? 'n/a' : '$' + runtime.balanceUsd.toFixed(2)}`);
+    log.info(`  ${bestTxt}`);
+    if (fails.length) log.info(`  blocking: ${fails.join(' | ')}`);
   }
 
   async function validateSeries() {
@@ -2247,7 +2290,16 @@ __def('engine', (module, exports) => {
     }
 
     runtime.running = true;
-    log.info(`engine: running in ${CFG.PAPER_MODE ? 'PAPER' : 'LIVE'} mode, bet $${runtime.betUsd} × ${runtime.slots} slots`);
+    log.info(`engine: BUILD ${BUILD} — ${CFG.PAPER_MODE ? 'PAPER' : 'LIVE'} mode, bet $${runtime.betUsd} × ${runtime.slots} slots`);
+    log.info(`config: entry=${CFG.ENTRY_MODE}`
+      + (CFG.ENTRY_MODE === 'probability' ? ` minProb=${CFG.MIN_PROB_PCT}%` : ` minEdge=${CFG.MIN_EDGE_CENTS}c`)
+      + ` style=${CFG.ORDER_STYLE} spread<=${CFG.MAX_SPREAD_CENTS}c |z|>=${CFG.MIN_ABS_Z}`
+      + ` time=${CFG.MIN_SECONDS_TO_CLOSE}-${CFG.MAX_SECONDS_TO_CLOSE}s ttl=${CFG.ORDER_TTL_S}s`
+      + ` fillFloor=${CFG.MIN_FILL_FRACTION} quoteEmpty=${CFG.QUOTE_EMPTY_BOOKS}`);
+    await refreshBalance();
+    log.info(`balance: ${runtime.balanceUsd == null
+      ? 'UNREADABLE — gate fails open, orders will still be sent'
+      : '$' + runtime.balanceUsd.toFixed(2)}`);
 
     const loop = async () => {
       try { await tick(); }
@@ -2283,7 +2335,7 @@ __def('engine', (module, exports) => {
   module.exports = { start, runtime, setBet, setSlots, tick, discover, rejectSummary };
 });
 
-// ═══ server ═════════════════
+// ═══ server ════════════════
 const path = require('path');
 const express = require('express');
 const CFG = __req('config');
