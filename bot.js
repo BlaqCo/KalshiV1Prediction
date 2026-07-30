@@ -15,7 +15,7 @@ function __req(name) {
   return m.exports;
 }
 
-// ═══ module: config ═════════════════════
+// ═══ module: config ═══════════════════════
 __def('config', (module, exports) => {
   const num = (v, d) => (v === undefined || v === '' || isNaN(Number(v)) ? d : Number(v));
   const bool = (v, d) => (v === undefined || v === '' ? d : String(v).toLowerCase() === 'true');
@@ -140,8 +140,11 @@ __def('config', (module, exports) => {
     // ---------- execution ----------
     ORDER_STYLE: str(process.env.ORDER_STYLE, 'limit_touch'), // limit_touch | cross
     LIMIT_OFFSET_CENTS: num(process.env.LIMIT_OFFSET_CENTS, 0),
-    ORDER_TTL_S: num(process.env.ORDER_TTL_S, 25),
+    // A resting quote needs TIME to get hit. 25s in a market that trades a few
+    // times a minute means cancelling before anyone could ever take it.
+    ORDER_TTL_S: num(process.env.ORDER_TTL_S, 240),
     ORDER_FAIL_COOLDOWN_S: num(process.env.ORDER_FAIL_COOLDOWN_S, 60),
+    PAUSE_COOLDOWN_S: num(process.env.PAUSE_COOLDOWN_S, 90),
     FEE_RATE: num(process.env.FEE_RATE, 0.07),               // Kalshi: ceil(rate*C*P*(1-P))
     SLIPPAGE_CENTS: num(process.env.SLIPPAGE_CENTS, 0.5),
 
@@ -179,7 +182,7 @@ __def('config', (module, exports) => {
   module.exports = CFG;
 });
 
-// ═══ module: log ═════════════════════
+// ═══ module: log ═══════════════════════
 __def('log', (module, exports) => {
   const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
   const min = LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] || 20;
@@ -207,7 +210,7 @@ __def('log', (module, exports) => {
   };
 });
 
-// ═══ module: store ═════════════════════
+// ═══ module: store ═══════════════════════
 __def('store', (module, exports) => {
   const CFG = __req('config');
 
@@ -324,7 +327,7 @@ __def('store', (module, exports) => {
   module.exports = store;
 });
 
-// ═══ module: kalshi ═════════════════════
+// ═══ module: kalshi ═══════════════════════
 __def('kalshi', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -502,7 +505,7 @@ __def('kalshi', (module, exports) => {
   module.exports = kalshi;
 });
 
-// ═══ module: pricing ═════════════════════
+// ═══ module: pricing ═══════════════════════
 __def('pricing', (module, exports) => {
   const CFG = __req('config');
 
@@ -648,7 +651,7 @@ __def('pricing', (module, exports) => {
   module.exports = { fairValue, feeCents, Phi, settleVarMultiplier };
 });
 
-// ═══ module: oracle ═════════════════════
+// ═══ module: oracle ═══════════════════════
 __def('oracle', (module, exports) => {
   const WebSocket = require('ws');
   const CFG = __req('config');
@@ -981,7 +984,7 @@ __def('oracle', (module, exports) => {
   };
 });
 
-// ═══ module: portfolio ═════════════════════
+// ═══ module: portfolio ═══════════════════════
 __def('portfolio', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -1200,7 +1203,7 @@ __def('portfolio', (module, exports) => {
   };
 });
 
-// ═══ module: strategy ═════════════════════
+// ═══ module: strategy ═══════════════════════
 __def('strategy', (module, exports) => {
   const CFG = __req('config');
   const { fairValue, feeCents } = __req('pricing');
@@ -1395,8 +1398,10 @@ __def('strategy', (module, exports) => {
       let price, depth, entry, passive = null;
 
       if (ask != null) {
-        // passive entry improves the bid by a cent; crossing lifts the ask
-        passive = bid != null ? Math.min(ask, bid + 1) : ask;
+        // Improve the bid by a cent, but never reach the ask — post_only rejects
+        // ("post only cross") if the price would take. On a 1c spread there is no
+        // room to improve, so join the bid and wait in the queue instead.
+        passive = bid != null ? Math.max(bid, Math.min(bid + 1, ask - 1)) : ask;
         price = cross ? ask : passive;
         depth = cross ? askSize : bidSize;
         entry = cross ? 'cross' : 'post';
@@ -1501,7 +1506,7 @@ __def('strategy', (module, exports) => {
   module.exports = { evaluate, readBook, contractsFor, sizeUsd, FREQ };
 });
 
-// ═══ module: engine ═════════════════════
+// ═══ module: engine ═══════════════════════
 __def('engine', (module, exports) => {
   const CFG = __req('config');
   const log = __req('log');
@@ -1827,10 +1832,23 @@ __def('engine', (module, exports) => {
       orderCooldown.delete(m.ticker);
     } catch (e) {
       runtime.errors += 1;
-      // Back off this market so a systemic rejection doesn't hammer the endpoint
-      // dozens of times a minute the way the v1 410 did.
-      orderCooldown.set(m.ticker, Date.now() + CFG.ORDER_FAIL_COOLDOWN_S * 1000);
-      log.error(`order failed ${m.ticker}: ${e.message}`);
+      const msg = String(e.message || '');
+      // Kalshi pauses trading around settlement. That's the exchange's state, not
+      // a fault of ours: back off longer and log it once as a warning, not an error.
+      if (msg.includes('trading_is_paused')) {
+        orderCooldown.set(m.ticker, Date.now() + CFG.PAUSE_COOLDOWN_S * 1000);
+        if (!runtime.pausedNotedAt || Date.now() - runtime.pausedNotedAt > 60000) {
+          runtime.pausedNotedAt = Date.now();
+          log.warn(`exchange paused trading — backing off ${CFG.PAUSE_COOLDOWN_S}s`);
+        }
+      } else if (msg.includes('post only cross')) {
+        // Our quote would have taken; the book moved between read and send.
+        orderCooldown.set(m.ticker, Date.now() + 10000);
+        log.debug(`post-only would cross on ${m.ticker} — skipping this tick`);
+      } else {
+        orderCooldown.set(m.ticker, Date.now() + CFG.ORDER_FAIL_COOLDOWN_S * 1000);
+        log.error(`order failed ${m.ticker}: ${e.message}`);
+      }
     }
     return null;
   }
@@ -1844,14 +1862,20 @@ __def('engine', (module, exports) => {
   async function reconcilePending() {
     for (const [ticker, p] of [...runtime.pending.entries()]) {
       try {
-        const res = await kalshi.order(p.orderId);
-        const o = res.order || res;
-        const filled = Number(o.fill_count ?? o.filled_count ?? o.taker_fill_count ?? 0);
-        const remaining = Number(o.remaining_count ?? 1);
-        if (filled > 0 && (o.status === 'executed' || remaining === 0)) {
-          const px = o.average_fill_price != null
-            ? avgFillToSideCents(p.base.side, o.average_fill_price)
-            : Number(o.yes_price ?? o.no_price ?? p.limit);
+        // GET /portfolio/orders/{id} 404s for V2-created orders, so detect fills
+        // from the fills feed instead — it carries our order_id and real prices.
+        const res = await kalshi.fills(p.base.ticker, 50);
+        const mine = (res.fills || []).filter(f => f.order_id === p.orderId);
+        const filled = mine.reduce((a, f) => a + Number(f.count ?? f.count_fp ?? 0), 0);
+        if (filled > 0) {
+          const notional = mine.reduce((a, f) => {
+            const yesC = f.yes_price_dollars != null
+              ? Number(f.yes_price_dollars) * 100
+              : Number(f.yes_price ?? 0);
+            const c = p.base.side === 'yes' ? yesC : 100 - yesC;
+            return a + c * Number(f.count ?? f.count_fp ?? 0);
+          }, 0);
+          const px = notional / filled;
           await pf.open({
             ...p.base,
             contracts: filled,
@@ -1864,7 +1888,7 @@ __def('engine', (module, exports) => {
         } else if (Date.now() - p.placedAt > CFG.ORDER_TTL_S * 1000) {
           await kalshi.cancelOrder(p.orderId).catch(() => {});
           runtime.pending.delete(ticker);
-          log.info(`ORDER expired ${ticker} — cancelled`);
+          log.info(`ORDER expired ${ticker} — cancelled after ${CFG.ORDER_TTL_S}s unfilled`);
         }
       } catch (e) {
         log.warn(`reconcile ${ticker}: ${e.message}`);
@@ -2106,7 +2130,7 @@ __def('engine', (module, exports) => {
   module.exports = { start, runtime, setBet, setSlots, tick, discover, rejectSummary };
 });
 
-// ═══ server ════════════════════
+// ═══ server ═════════════════════
 const path = require('path');
 const express = require('express');
 const CFG = __req('config');
