@@ -1,28 +1,26 @@
 'use strict';
 /**
- * 0XBLAQ · KALSHI HOURLY ENGINE — single-file build
+ * 0XBLAQ · KALSHI ENGINE — single-file build
  *
- * The whole bot in one file. Ten modules are kept in separate scopes by a ~10
- * line inline registry at the top, so the code reads exactly as it would across
- * ten files and nothing leaks between them. Search for `=== module: name ===`
- * to jump around.
+ * Hourly and quarter-hour crypto binaries. Ten modules held in separate scopes
+ * by a ~10 line inline registry, so the code reads as it would across ten files
+ * and nothing leaks between them. Search `=== module: name ===` to jump around.
  *
- * Companion files: index.html (dashboard), package.json. That's the whole repo.
+ * Companion files: index.html (dashboard), package.json.
  */
 
-// ── inline module registry ───────────────────────────────────────────────────
 const __registry = {};
 const __cache = {};
 const __def = (name, factory) => { __registry[name] = factory; };
 function __req(name) {
   if (__cache[name]) return __cache[name].exports;
   const m = { exports: {} };
-  __cache[name] = m;                       // set before running: tolerates cycles
+  __cache[name] = m;
   __registry[name](m, m.exports);
   return m.exports;
 }
 
-// ═══ module: config ═══════════════════════════════════════════════════════
+// ═══ module: config ════════════════════════════════════
 __def('config', (module, exports) => {
   const num = (v, d) => (v === undefined || v === '' || isNaN(Number(v)) ? d : Number(v));
   const bool = (v, d) => (v === undefined || v === '' ? d : String(v).toLowerCase() === 'true');
@@ -52,6 +50,12 @@ __def('config', (module, exports) => {
     SERIES: str(
       process.env.SERIES,
       'KXBTCD,KXETHD,KXSOLD,KXXRPD,KXDOGED,KXBNBD,KXHYPED'
+    ).split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
+
+    // Quarter-hour up/down families. Same engine, different clock — see FREQ below.
+    SERIES_15M: str(
+      process.env.SERIES_15M,
+      'KXBTC15M,KXETH15M,KXSOL15M,KXXRP15M,KXDOGE15M'
     ).split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
 
     // ---------- oracle ----------
@@ -101,7 +105,10 @@ __def('config', (module, exports) => {
     BET_USD: num(process.env.BET_USD, 25),                   // live value, slider-controlled
     EDGE_SCALING: bool(process.env.EDGE_SCALING, false),     // scale within band by edge
     EDGE_SCALE_FULL_CENTS: num(process.env.EDGE_SCALE_FULL_CENTS, 12),
-    MAX_OPEN_POSITIONS: num(process.env.MAX_OPEN_POSITIONS, 6),
+    SLOTS: num(process.env.SLOTS, 3),                        // live value, toggle-controlled
+    SLOTS_MIN: num(process.env.SLOTS_MIN, 1),
+    SLOTS_MAX: num(process.env.SLOTS_MAX, 5),
+    MAX_OPEN_POSITIONS: num(process.env.MAX_OPEN_POSITIONS, 6), // hard ceiling above the toggle
     MAX_PER_ASSET: num(process.env.MAX_PER_ASSET, 2),
     MAX_PER_MARKET: num(process.env.MAX_PER_MARKET, 1),
     DAILY_LOSS_LIMIT_USD: num(process.env.DAILY_LOSS_LIMIT_USD, 150),
@@ -126,6 +133,19 @@ __def('config', (module, exports) => {
     UPSTASH_REDIS_REST_TOKEN: str(process.env.UPSTASH_REDIS_REST_TOKEN, ''),
     REDIS_PREFIX: str(process.env.REDIS_PREFIX, 'kho:'),
 
+    // ---------- per-frequency overrides ----------
+    // A 15-minute contract lives 900s end to end, so hourly time gates would let
+    // it trade for two thirds of its life and then some. Everything that scales
+    // with the clock gets its own value.
+    MIN_SECONDS_15M: num(process.env.MIN_SECONDS_15M, 45),
+    MAX_SECONDS_15M: num(process.env.MAX_SECONDS_15M, 720),
+    MIN_EDGE_CENTS_15M: num(process.env.MIN_EDGE_CENTS_15M, 5.0),
+    MAX_SPREAD_CENTS_15M: num(process.env.MAX_SPREAD_CENTS_15M, 3),
+    // Sources disagree on whether the quarter-hour families settle on the same
+    // 60s index average as the hourlies or on a point reference captured on the
+    // market record. Set to 1 to price them as a point settlement instead.
+    SETTLE_WINDOW_15M: num(process.env.SETTLE_WINDOW_15M, 60),
+
     // ---------- dashboard ----------
     DASH_TOKEN: str(process.env.DASH_TOKEN, ''),             // optional write-auth
   };
@@ -136,7 +156,7 @@ __def('config', (module, exports) => {
   module.exports = CFG;
 });
 
-// ═══ module: log ═══════════════════════════════════════════════════════
+// ═══ module: log ════════════════════════════════════
 __def('log', (module, exports) => {
   const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
   const min = LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] || 20;
@@ -164,7 +184,7 @@ __def('log', (module, exports) => {
   };
 });
 
-// ═══ module: store ═══════════════════════════════════════════════════════
+// ═══ module: store ════════════════════════════════════
 __def('store', (module, exports) => {
   const CFG = __req('config');
 
@@ -281,7 +301,7 @@ __def('store', (module, exports) => {
   module.exports = store;
 });
 
-// ═══ module: kalshi ═══════════════════════════════════════════════════════
+// ═══ module: kalshi ════════════════════════════════════
 __def('kalshi', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -439,7 +459,7 @@ __def('kalshi', (module, exports) => {
   module.exports = kalshi;
 });
 
-// ═══ module: pricing ═══════════════════════════════════════════════════════
+// ═══ module: pricing ════════════════════════════════════
 __def('pricing', (module, exports) => {
   const CFG = __req('config');
 
@@ -488,7 +508,7 @@ __def('pricing', (module, exports) => {
    */
   function fairValue(o, m) {
     const tau = Math.max(1, m.tau);
-    const W = CFG.SETTLE_WINDOW_S;
+    const W = Math.max(1, m.settleWindow ?? CFG.SETTLE_WINDOW_S);
     const spot = o.composite;
     const index = o.index ?? spot;
     if (!(spot > 0) || !(index > 0) || !(o.sigma > 0)) return null;
@@ -585,7 +605,7 @@ __def('pricing', (module, exports) => {
   module.exports = { fairValue, feeCents, Phi, settleVarMultiplier };
 });
 
-// ═══ module: oracle ═══════════════════════════════════════════════════════
+// ═══ module: oracle ════════════════════════════════════
 __def('oracle', (module, exports) => {
   const WebSocket = require('ws');
   const CFG = __req('config');
@@ -913,7 +933,7 @@ __def('oracle', (module, exports) => {
   };
 });
 
-// ═══ module: portfolio ═══════════════════════════════════════════════════════
+// ═══ module: portfolio ════════════════════════════════════
 __def('portfolio', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -980,6 +1000,9 @@ __def('portfolio', (module, exports) => {
       feeUsd: entry.feeUsd,
       openedAt: Date.now(),
       closeTime: entry.closeTime,
+      freq: entry.freq || 'hourly',
+      freqLabel: entry.freqLabel || '1H',
+      settleWindow: entry.settleWindow,
       floorStrike: entry.floorStrike,
       capStrike: entry.capStrike,
       // full decision record — this is what makes the ledger useful later
@@ -998,7 +1021,7 @@ __def('portfolio', (module, exports) => {
     P.day.trades += 1;
     await store.hset('positions', pos.ticker, pos);
     await persistState();
-    log.info(`OPEN ${pos.asset} ${pos.ticker} ${pos.side.toUpperCase()} x${pos.contracts} @ ${pos.entryPrice}¢ (edge ${pos.edgeCents.toFixed(1)}¢)`);
+    log.info(`OPEN ${pos.asset} [${pos.freqLabel}] ${pos.ticker} ${pos.side.toUpperCase()} x${pos.contracts} @ ${pos.entryPrice}¢ (edge ${pos.edgeCents.toFixed(1)}¢)`);
     return pos;
   }
 
@@ -1081,12 +1104,20 @@ __def('portfolio', (module, exports) => {
     const wins = settled.filter(t => t.pnlUsd > 0).length;
     const totalStaked = settled.reduce((a, t) => a + t.costUsd, 0);
     const byAsset = {};
+    const byFreq = {};
     for (const t of settled) {
       const a = byAsset[t.asset] || { w: 0, l: 0, pnl: 0 };
       if (t.pnlUsd > 0) a.w += 1; else a.l += 1;
       a.pnl += t.pnlUsd;
       byAsset[t.asset] = a;
+
+      const k = t.freqLabel || '1H';
+      const f = byFreq[k] || { w: 0, l: 0, pnl: 0, staked: 0 };
+      if (t.pnlUsd > 0) f.w += 1; else f.l += 1;
+      f.pnl += t.pnlUsd; f.staked += t.costUsd;
+      byFreq[k] = f;
     }
+    for (const f of Object.values(byFreq)) f.roi = f.staked > 0 ? (f.pnl / f.staked) * 100 : 0;
     const calib = Object.entries(P.calibration).map(([b, c]) => ({
       bucket: `${b * 10}-${b * 10 + 10}%`,
       n: c.n,
@@ -1108,6 +1139,7 @@ __def('portfolio', (module, exports) => {
       avgHoldSec: settled.length ? settled.reduce((a, t) => a + (t.holdSec || 0), 0) / settled.length : 0,
       day: P.day,
       byAsset,
+      byFreq,
       calibration: calib,
       equityCurve: P.equityCurve.slice(-240),
     };
@@ -1120,7 +1152,7 @@ __def('portfolio', (module, exports) => {
   };
 });
 
-// ═══ module: strategy ═══════════════════════════════════════════════════════
+// ═══ module: strategy ════════════════════════════════════
 __def('strategy', (module, exports) => {
   const CFG = __req('config');
   const { fairValue, feeCents } = __req('pricing');
@@ -1131,6 +1163,22 @@ __def('strategy', (module, exports) => {
    * why a candidate died — and so the calibration ledger can tell you later which
    * gate was actually earning its keep.
    */
+
+  /** Per-frequency tuning. The model is identical; only the clock changes. */
+  const FREQ = {
+    hourly: {
+      key: 'hourly', label: '1H',
+      minSec: CFG.MIN_SECONDS_TO_CLOSE, maxSec: CFG.MAX_SECONDS_TO_CLOSE,
+      minEdge: CFG.MIN_EDGE_CENTS, maxSpread: CFG.MAX_SPREAD_CENTS,
+      settleWindow: CFG.SETTLE_WINDOW_S,
+    },
+    m15: {
+      key: 'm15', label: '15M',
+      minSec: CFG.MIN_SECONDS_15M, maxSec: CFG.MAX_SECONDS_15M,
+      minEdge: CFG.MIN_EDGE_CENTS_15M, maxSpread: CFG.MAX_SPREAD_CENTS_15M,
+      settleWindow: CFG.SETTLE_WINDOW_15M,
+    },
+  };
 
   function readBook(ob) {
     const yes = (ob?.orderbook?.yes || []).filter(l => Array.isArray(l) && l.length >= 2);
@@ -1174,6 +1222,8 @@ __def('strategy', (module, exports) => {
    */
   function evaluate(ctx) {
     const { market, ob, o, betUsd, exposure } = ctx;
+    const slots = Math.min(ctx.maxSlots ?? CFG.SLOTS, CFG.MAX_OPEN_POSITIONS);
+    const F = ctx.freq || FREQ.hourly;
     const now = Date.now();
     const closeMs = Date.parse(market.close_time);
     const tau = (closeMs - now) / 1000;
@@ -1182,6 +1232,7 @@ __def('strategy', (module, exports) => {
     const fv = fairValue(o, {
       floorStrike: market.floor_strike ?? null,
       capStrike: market.cap_strike ?? null,
+      settleWindow: F.settleWindow,
       tau,
     });
 
@@ -1194,12 +1245,12 @@ __def('strategy', (module, exports) => {
       'index reconstruction must be quorate and tight');
 
     const okTime = G('time',
-      tau >= CFG.MIN_SECONDS_TO_CLOSE && tau <= CFG.MAX_SECONDS_TO_CLOSE,
+      tau >= F.minSec && tau <= F.maxSec,
       `${Math.round(tau)}s`,
       'skip the gamma lottery at the bell and the dead zone at the open');
 
     const okBook = G('liquidity',
-      book.spread != null && book.spread <= CFG.MAX_SPREAD_CENTS,
+      book.spread != null && book.spread <= F.maxSpread,
       book.spread == null ? 'no book' : `${book.spread}¢`,
       'crossing a wide book eats the edge you came for');
 
@@ -1273,18 +1324,18 @@ __def('strategy', (module, exports) => {
       'never fade a one-sided tape');
 
     const okEdge = G('edge',
-      best.net >= CFG.MIN_EDGE_CENTS,
+      best.net >= F.minEdge,
       `${best.net.toFixed(1)}¢ net`,
       'after fee and slippage, not before');
 
     const okExposure = G('exposure',
-      exposure.open < CFG.MAX_OPEN_POSITIONS
+      exposure.open < slots
       && (exposure.byAsset[ctx.asset] || 0) < CFG.MAX_PER_ASSET
       && !exposure.tickers.has(market.ticker)
       && exposure.dayPnl > -CFG.DAILY_LOSS_LIMIT_USD
       && exposure.dayTrades < CFG.DAILY_TRADE_LIMIT,
-      `${exposure.open}/${CFG.MAX_OPEN_POSITIONS} open`,
-      'position, per-asset, daily loss and daily count caps');
+      `${exposure.open}/${slots} slots`,
+      'slot count, per-asset, daily loss and daily count caps');
 
     const pass = okOracle && okTime && okBook && okRegime && okMoney && okAgree
       && okDepth && okPrice && okFlow && okEdge && okExposure;
@@ -1301,22 +1352,23 @@ __def('strategy', (module, exports) => {
     };
   }
 
-  module.exports = { evaluate, readBook, contractsFor, sizeUsd };
+  module.exports = { evaluate, readBook, contractsFor, sizeUsd, FREQ };
 });
 
-// ═══ module: engine ═══════════════════════════════════════════════════════
+// ═══ module: engine ════════════════════════════════════
 __def('engine', (module, exports) => {
   const CFG = __req('config');
   const log = __req('log');
   const kalshi = __req('kalshi');
   const oracle = __req('oracle');
   const pf = __req('portfolio');
-  const { evaluate, readBook } = __req('strategy');
+  const { evaluate, readBook, FREQ } = __req('strategy');
   const { feeCents, fairValue } = __req('pricing');
   const store = __req('store');
 
   const runtime = {
     betUsd: CFG.BET_USD,
+    slots: Math.max(CFG.SLOTS_MIN, Math.min(CFG.SLOTS_MAX, CFG.SLOTS)),
     running: false,
     paused: false,
     startedAt: Date.now(),
@@ -1330,12 +1382,15 @@ __def('engine', (module, exports) => {
     errors: 0,
   };
 
-  const SUFFIX = /^KX([A-Z]+?)D?$/;
+  // KXBTCD -> BTC (hourly), KXBTC15M -> BTC (quarter-hour)
+  const SUFFIX = /^KX([A-Z]+?)(?:D|15M)?$/;
   function assetFromSeries(series) {
     const m = SUFFIX.exec(series);
     if (m && oracle.ASSETS.includes(m[1])) return m[1];
-    for (const a of oracle.ASSETS) if (series.includes(a)) return a;
-    return null;
+    // longest match first so DOGE doesn't lose to a shorter substring
+    const hit = [...oracle.ASSETS].sort((a, b) => b.length - a.length)
+      .find(a => series.includes(a));
+    return hit || null;
   }
 
   // ----------------------------------------------------------- market discovery
@@ -1350,11 +1405,12 @@ __def('engine', (module, exports) => {
       if (!asset) continue;
       try {
         const res = await kalshi.markets(series.ticker, 200);
+        const F = series.freq;
         for (const m of res.markets || []) {
           const tau = (Date.parse(m.close_time) - Date.now()) / 1000;
-          if (!(tau > 0) || tau > CFG.MAX_SECONDS_TO_CLOSE + 600) continue;
+          if (!(tau > 0) || tau > F.maxSec + 600) continue;
           if (m.status !== 'active' && m.status !== 'open') continue;
-          out.push({ ...m, _asset: asset, _series: series.ticker });
+          out.push({ ...m, _asset: asset, _series: series.ticker, _freq: F });
         }
       } catch (e) {
         runtime.errors += 1;
@@ -1376,11 +1432,13 @@ __def('engine', (module, exports) => {
     for (const m of markets) {
       const o = oracle.get(m._asset);
       if (!o || !(o.composite > 0) || !(o.sigma > 0)) continue;
+      const F = m._freq || FREQ.hourly;
       const tau = (Date.parse(m.close_time) - Date.now()) / 1000;
-      if (tau < CFG.MIN_SECONDS_TO_CLOSE || tau > CFG.MAX_SECONDS_TO_CLOSE) continue;
+      if (tau < F.minSec || tau > F.maxSec) continue;
       const fv = fairValue(o, {
         floorStrike: m.floor_strike ?? null,
         capStrike: m.cap_strike ?? null,
+        settleWindow: F.settleWindow,
         tau,
       });
       if (!fv) continue;
@@ -1392,7 +1450,7 @@ __def('engine', (module, exports) => {
     const perKey = {};
     const out = [];
     for (const p of picked) {
-      const key = `${p.m._asset}|${p.m.close_time}`;
+      const key = `${p.m._asset}|${p.m._freq.key}|${p.m.close_time}`;
       perKey[key] = (perKey[key] || 0) + 1;
       if (perKey[key] <= 4) out.push(p.m);
     }
@@ -1414,6 +1472,9 @@ __def('engine', (module, exports) => {
       price: c.price,
       feeUsd,
       closeTime: m.close_time,
+      freq: (m._freq || FREQ.hourly).key,
+      freqLabel: (m._freq || FREQ.hourly).label,
+      settleWindow: (m._freq || FREQ.hourly).settleWindow,
       floorStrike: m.floor_strike ?? null,
       capStrike: m.cap_strike ?? null,
       modelP: c.modelP,
@@ -1509,7 +1570,7 @@ __def('engine', (module, exports) => {
 
     if (yesWon == null) {
       const o = oracle.get(pos.asset);
-      yesWon = satisfies(pos, o ? o.settlementValue() : null);
+      yesWon = satisfies(pos, o ? o.settlementValue(pos.settleWindow) : null);
       if (yesWon == null) return false;  // retry next tick
     }
 
@@ -1537,7 +1598,10 @@ __def('engine', (module, exports) => {
       pf.mark(pos.ticker, bid);
 
       const o = oracle.get(pos.asset);
-      const fv = o ? fairValue(o, { floorStrike: pos.floorStrike, capStrike: pos.capStrike, tau }) : null;
+      const fv = o ? fairValue(o, {
+        floorStrike: pos.floorStrike, capStrike: pos.capStrike,
+        settleWindow: pos.settleWindow, tau,
+      }) : null;
       const pSide = fv ? (pos.side === 'yes' ? fv.p : 1 - fv.p) : null;
       const liveEdge = pSide != null ? pSide * 100 - bid : null;
 
@@ -1599,14 +1663,16 @@ __def('engine', (module, exports) => {
       runtime.candidatesSeen += 1;
 
       const decision = evaluate({
-        market: m, ob, o, asset: m._asset,
+        market: m, ob, o, asset: m._asset, freq: m._freq,
         betUsd: runtime.betUsd,
+        maxSlots: runtime.slots,
         exposure: pf.exposure(),
       });
 
       view.push({
         ticker: m.ticker,
         asset: m._asset,
+        freq: (m._freq || FREQ.hourly).label,
         title: m.yes_sub_title || m.subtitle || m.title || m.ticker,
         floorStrike: m.floor_strike ?? null,
         capStrike: m.cap_strike ?? null,
@@ -1633,17 +1699,25 @@ __def('engine', (module, exports) => {
 
   async function validateSeries() {
     const ok = [];
-    for (const t of CFG.SERIES) {
+    const families = [
+      ...CFG.SERIES.map(t => ({ t, freq: FREQ.hourly })),
+      ...CFG.SERIES_15M.map(t => ({ t, freq: FREQ.m15 })),
+    ];
+    for (const { t, freq } of families) {
       try {
         const res = await kalshi.series(t);
         const s = res.series || res;
-        ok.push({ ticker: t, title: s.title || t, asset: assetFromSeries(t) });
-        log.info(`series ok: ${t} → ${assetFromSeries(t)}`);
+        const asset = assetFromSeries(t);
+        ok.push({ ticker: t, title: s.title || t, asset, freq });
+        log.info(`series ok: ${t} → ${asset} [${freq.label}]`);
       } catch (e) {
-        log.warn(`series ${t} unavailable (${e.status || '?'}) — dropped`);
+        log.warn(`series ${t} [${freq.label}] unavailable (${e.status || '?'}) — dropped`);
       }
     }
     runtime.series = ok;
+    const n1 = ok.filter(s => s.freq.key === 'hourly').length;
+    const n2 = ok.filter(s => s.freq.key === 'm15').length;
+    log.info(`series: ${n1} hourly, ${n2} quarter-hour`);
   }
 
   let timer = null;
@@ -1664,7 +1738,7 @@ __def('engine', (module, exports) => {
     }
 
     runtime.running = true;
-    log.info(`engine: running in ${CFG.PAPER_MODE ? 'PAPER' : 'LIVE'} mode, bet $${runtime.betUsd}`);
+    log.info(`engine: running in ${CFG.PAPER_MODE ? 'PAPER' : 'LIVE'} mode, bet $${runtime.betUsd} × ${runtime.slots} slots`);
 
     const loop = async () => {
       try { await tick(); }
@@ -1672,6 +1746,21 @@ __def('engine', (module, exports) => {
       timer = setTimeout(loop, CFG.ENGINE_TICK_MS);
     };
     loop();
+  }
+
+  /**
+   * Lowering the slot count never force-closes anything — it just stops new
+   * entries until positions drain below the new line. Yanking capital out of a
+   * live contract to satisfy a UI change would be the worst possible exit.
+   */
+  function setSlots(n) {
+    const v = Math.max(CFG.SLOTS_MIN,
+      Math.min(CFG.SLOTS_MAX, CFG.MAX_OPEN_POSITIONS, Math.round(Number(n))));
+    runtime.slots = v;
+    store.set('slots', v).catch(() => {});
+    const openNow = pf.exposure().open;
+    log.info(`slots set to ${v}${openNow > v ? ` — ${openNow} open, draining before new entries` : ''}`);
+    return v;
   }
 
   function setBet(usd) {
@@ -1682,10 +1771,10 @@ __def('engine', (module, exports) => {
     return v;
   }
 
-  module.exports = { start, runtime, setBet, tick, discover };
+  module.exports = { start, runtime, setBet, setSlots, tick, discover };
 });
 
-// ═══ server ══════════════════════════════════════════════════════════════
+// ═══ server ══════════════════════════════════════
 const path = require('path');
 const express = require('express');
 const CFG = __req('config');
@@ -1726,6 +1815,13 @@ app.get('/api/state', (req, res) => {
       max: CFG.BET_MAX_USD,
       edgeScaling: CFG.EDGE_SCALING,
     },
+    slots: {
+      value: engine.runtime.slots,
+      min: CFG.SLOTS_MIN,
+      max: Math.min(CFG.SLOTS_MAX, CFG.MAX_OPEN_POSITIONS),
+      used: pf.positions().length,
+      atRisk: pf.stats().deployed,
+    },
     thresholds: {
       minEdge: CFG.MIN_EDGE_CENTS,
       maxSpread: CFG.MAX_SPREAD_CENTS,
@@ -1751,6 +1847,13 @@ app.post('/api/bet', (req, res) => {
   res.json({ usd: engine.setBet(usd) });
 });
 
+app.post('/api/slots', (req, res) => {
+  if (!authed(req)) return res.status(403).json({ error: 'bad token' });
+  const n = Number(req.body?.slots);
+  if (!(n >= 1)) return res.status(400).json({ error: 'slots must be 1 or more' });
+  res.json({ slots: engine.setSlots(n) });
+});
+
 app.post('/api/pause', (req, res) => {
   if (!authed(req)) return res.status(403).json({ error: 'bad token' });
   engine.runtime.paused = Boolean(req.body?.paused);
@@ -1767,6 +1870,7 @@ app.get('/api/health', (_req, res) => {
 app.listen(CFG.PORT, () => {
   log.info(`dashboard on :${CFG.PORT}`);
   store.get('betUsd').then(v => { if (v) engine.setBet(v); }).catch(() => {});
+  store.get('slots').then(v => { if (v) engine.setSlots(v); }).catch(() => {});
   engine.start().catch(e => log.error(`engine start failed: ${e.message}`));
 });
 
