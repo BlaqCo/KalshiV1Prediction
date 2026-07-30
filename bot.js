@@ -15,7 +15,7 @@ function __req(name) {
   return m.exports;
 }
 
-// ═══ module: config ══════════════════════
+// ═══ module: config ═══════════════════
 __def('config', (module, exports) => {
   const num = (v, d) => (v === undefined || v === '' || isNaN(Number(v)) ? d : Number(v));
   const bool = (v, d) => (v === undefined || v === '' ? d : String(v).toLowerCase() === 'true');
@@ -201,7 +201,7 @@ __def('config', (module, exports) => {
   module.exports = CFG;
 });
 
-// ═══ module: log ══════════════════════
+// ═══ module: log ═══════════════════
 __def('log', (module, exports) => {
   const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
   const min = LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] || 20;
@@ -229,7 +229,7 @@ __def('log', (module, exports) => {
   };
 });
 
-// ═══ module: store ══════════════════════
+// ═══ module: store ═══════════════════
 __def('store', (module, exports) => {
   const CFG = __req('config');
 
@@ -346,7 +346,7 @@ __def('store', (module, exports) => {
   module.exports = store;
 });
 
-// ═══ module: kalshi ══════════════════════
+// ═══ module: kalshi ═══════════════════
 __def('kalshi', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -524,7 +524,7 @@ __def('kalshi', (module, exports) => {
   module.exports = kalshi;
 });
 
-// ═══ module: pricing ══════════════════════
+// ═══ module: pricing ═══════════════════
 __def('pricing', (module, exports) => {
   const CFG = __req('config');
 
@@ -670,7 +670,7 @@ __def('pricing', (module, exports) => {
   module.exports = { fairValue, feeCents, Phi, settleVarMultiplier };
 });
 
-// ═══ module: oracle ══════════════════════
+// ═══ module: oracle ═══════════════════
 __def('oracle', (module, exports) => {
   const WebSocket = require('ws');
   const CFG = __req('config');
@@ -1003,7 +1003,7 @@ __def('oracle', (module, exports) => {
   };
 });
 
-// ═══ module: portfolio ══════════════════════
+// ═══ module: portfolio ═══════════════════
 __def('portfolio', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -1037,6 +1037,21 @@ __def('portfolio', (module, exports) => {
     for (const [t, pos] of Object.entries(open)) P.positions.set(t, pos);
     P.trades = await store.list('trades', 300);
     log.info(`portfolio: hydrated — bankroll $${P.bankroll.toFixed(2)}, ${P.positions.size} open`);
+  }
+
+  /**
+   * In live mode the exchange is the source of truth for cash, not our ledger.
+   * We were starting from a notional $1,000 and decrementing locally, so after a
+   * session of real fills the dashboard showed a four-figure bankroll while the
+   * account held nothing. Realised P&L stays locally computed (it's the sum of
+   * closed trades); only cash is synced.
+   */
+  function syncBankroll(exchangeUsd) {
+    if (!Number.isFinite(exchangeUsd)) return;
+    const drift = exchangeUsd - P.bankroll;
+    P.bankroll = exchangeUsd;
+    P.bankrollSynced = true;
+    return drift;
   }
 
   async function persistState() {
@@ -1209,6 +1224,7 @@ __def('portfolio', (module, exports) => {
         medianStake: stakes.length ? [...stakes].sort((a, b) => a - b)[Math.floor(stakes.length / 2)] : 0,
       },
       bankroll: P.bankroll,
+      bankrollSynced: !!P.bankrollSynced,
       deployed: deployed(),
       unrealized: unrealized(),
       equity: equity(),
@@ -1228,13 +1244,13 @@ __def('portfolio', (module, exports) => {
   }
 
   module.exports = {
-    P, hydrate, open, close, mark, exposure, stats, equity, persistState,
+    P, hydrate, open, close, mark, exposure, stats, equity, persistState, syncBankroll,
     positions: () => [...P.positions.values()],
     trades: (n = 60) => P.trades.slice(0, n),
   };
 });
 
-// ═══ module: strategy ══════════════════════
+// ═══ module: strategy ═══════════════════
 __def('strategy', (module, exports) => {
   const CFG = __req('config');
   const { fairValue, feeCents } = __req('pricing');
@@ -1537,7 +1553,7 @@ __def('strategy', (module, exports) => {
   module.exports = { evaluate, readBook, contractsFor, sizeUsd, FREQ };
 });
 
-// ═══ module: engine ══════════════════════
+// ═══ module: engine ═══════════════════
 __def('engine', (module, exports) => {
   const CFG = __req('config');
   const log = __req('log');
@@ -1802,8 +1818,15 @@ __def('engine', (module, exports) => {
     // storm. Our internal bankroll is not the exchange's view of settled cash.
     const cost = (c.contracts * c.price) / 100;
     const avail = runtime.balanceUsd;
-    if (avail != null && cost > avail - CFG.BALANCE_BUFFER_USD) {
-      if (!runtime.balanceWarnedAt || Date.now() - runtime.balanceWarnedAt > 120000) {
+
+    // FAIL OPEN, not closed. This gate exists to avoid an insufficient_balance
+    // error storm — it is not a safety rail. If we can't read a positive balance
+    // we must not silently refuse to trade; let the order go and let the exchange
+    // arbitrate, because a rejected order is recoverable and a bot that quietly
+    // stops trading for hours is not.
+    const trustworthy = Number.isFinite(avail) && avail > 0;
+    if (trustworthy && cost > avail - CFG.BALANCE_BUFFER_USD) {
+      if (!runtime.balanceWarnedAt || Date.now() - runtime.balanceWarnedAt > 300000) {
         runtime.balanceWarnedAt = Date.now();
         log.warn(`balance $${avail.toFixed(2)} won't cover $${cost.toFixed(2)} + $${CFG.BALANCE_BUFFER_USD} buffer — holding off`);
       }
@@ -1904,6 +1927,34 @@ __def('engine', (module, exports) => {
       }
     }
     return null;
+  }
+
+  /**
+   * Kalshi has been removing cent-denominated fields in favour of `_dollars`
+   * equivalents, and the balance payload has moved before. Rather than assume one
+   * field name, look for any balance-ish key and infer its unit: a decimal string
+   * or a fractional number is dollars, a bare integer is cents.
+   */
+  function extractBalance(res) {
+    if (!res || typeof res !== 'object') return NaN;
+    const src = res.balance !== undefined || res.balance_dollars !== undefined
+      ? res
+      : (res.payload && typeof res.payload === 'object' ? res.payload : res);
+
+    const prefer = ['balance_dollars', 'available_balance_dollars', 'cash_dollars',
+                    'balance', 'available_balance', 'cash'];
+    let key = prefer.find(k => src[k] !== undefined);
+    if (!key) key = Object.keys(src).find(k => /balance|cash/i.test(k) && src[k] !== undefined);
+    if (!key) return NaN;
+
+    const raw = src[key];
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return NaN;
+    // dollars if the field says so, or if the value isn't a whole number
+    const isDollars = /_dollars$/.test(key)
+      || (typeof raw === 'string' && raw.includes('.'))
+      || !Number.isInteger(n);
+    return isDollars ? n : n / 100;
   }
 
   /** V2 reports the YES-leg fill price; convert back to the side we traded. */
@@ -2063,13 +2114,25 @@ __def('engine', (module, exports) => {
     if (Date.now() - runtime.balanceAt < CFG.BALANCE_REFRESH_S * 1000) return;
     try {
       const res = await kalshi.balance();
-      const b = res.balance_dollars != null
-        ? Number(res.balance_dollars)
-        : Number(res.balance ?? 0) / 100;
+      runtime.rawBalance = res;               // so the real field names are visible
+      const b = extractBalance(res);
       if (Number.isFinite(b)) {
-        if (runtime.balanceUsd == null) log.info(`exchange balance: $${b.toFixed(2)}`);
+        if (runtime.balanceUsd == null) {
+          log.info(`exchange balance: $${b.toFixed(2)} (from ${JSON.stringify(res).slice(0, 200)})`);
+        }
+        const drift = pf.syncBankroll(b);
+        if (drift != null && Math.abs(drift) > 1 && runtime.balanceUsd != null) {
+          log.debug(`bankroll resynced to exchange (${drift >= 0 ? '+' : ''}$${drift.toFixed(2)})`);
+        }
         runtime.balanceUsd = b;
         runtime.balanceAt = Date.now();
+      }
+      if (!Number.isFinite(b) || b <= 0) {
+        if (!runtime.balanceUnreadableAt || Date.now() - runtime.balanceUnreadableAt > 600000) {
+          runtime.balanceUnreadableAt = Date.now();
+          log.warn(`balance unreadable (got ${JSON.stringify(res).slice(0, 160)}) — `
+            + `trading anyway, exchange will reject if truly short`);
+        }
       }
     } catch (e) { log.debug(`balance refresh failed: ${e.message}`); }
   }
@@ -2220,7 +2283,7 @@ __def('engine', (module, exports) => {
   module.exports = { start, runtime, setBet, setSlots, tick, discover, rejectSummary };
 });
 
-// ═══ server ════════════════════
+// ═══ server ═════════════════
 const path = require('path');
 const express = require('express');
 const CFG = __req('config');
@@ -2290,6 +2353,7 @@ app.get('/api/state', (req, res) => {
     discovery: engine.runtime.discovery,
     rawBook: engine.runtime.rawBook,
     rawFill: engine.runtime.rawFill,
+    rawBalance: engine.runtime.rawBalance,
     balanceUsd: engine.runtime.balanceUsd,
     exits: {
       takeProfitPct: CFG.TAKE_PROFIT_PCT * 100,
