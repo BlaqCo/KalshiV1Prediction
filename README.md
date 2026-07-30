@@ -59,6 +59,35 @@ model is about to monetise.
 
 ---
 
+## Two clocks, one model
+
+`SERIES` carries the hourly families, `SERIES_15M` the quarter-hour up/down pairs.
+Both run through the same pricing engine — only the clock changes, and everything
+that scales with it gets its own value:
+
+| | hourly | 15-minute |
+|---|---|---|
+| time gate | 90–2700s | 45–720s |
+| min edge | 4.0¢ | 5.0¢ |
+| max spread | 4¢ | 3¢ |
+| settle window | 60s | 60s |
+
+The tighter edge and spread bars on the quarter-hour side are deliberate. Those
+markets reprice 30+ cents in a minute, so a stale quote costs more, and the same
+1.75¢ fee is a much larger share of a shorter-dated contract's expected move.
+
+**One open question worth testing.** My sources disagree on how the quarter-hour
+families settle: some describe the same 60-second index average as the hourlies,
+others describe a point reference captured directly on the market record. The
+distinction matters — a point settlement has no `W/3` variance term, so the model
+would be pricing those contracts ~40 seconds too long-dated. `SETTLE_WINDOW_15M`
+defaults to 60 to match the hourlies; set it to `1` to price them as a point
+settlement instead. Run both in demo and let the calibration panel say which is
+right. That is exactly the kind of question the ledger exists to answer.
+
+The **Splits** panel breaks W/L/P&L and ROI by clock before it breaks it by asset,
+so you can see which frequency is actually carrying you.
+
 ## The strategy
 
 Eleven gates. All must pass. Every gate records its measured value pass or fail,
@@ -100,21 +129,8 @@ optional hard flatten before the bell.
 
 ## Setup
 
-**1.** Four files, all at the repo root, no folders:
-
-```
-bot.js          the whole engine
-index.html      the dashboard
-package.json
-README.md
-```
-
-On mobile: **Add file → Upload files**, multi-select all four, one commit. Railway
-auto-detects Node and runs `npm start`.
-
-`bot.js` is a single-file build — the ten modules are held in separate scopes by a
-short inline registry at the top, so nothing leaks between them. Search for
-`=== module: oracle ===` to jump to a section.
+**1.** Push these files to a GitHub repo, then create a Railway service from it.
+Railway auto-detects Node and runs `npm start`.
 
 **2.** Kalshi API key: Kalshi account → Settings → API Keys → create one. You get
 a **Key ID** and download an **RSA private key** once. Paste the whole PEM,
@@ -181,6 +197,15 @@ the gate working, not a bug — add a venue that carries them if you want covera
 - **Trade log** — same expandable decision record on every closed trade.
 - **Flat bet slider**, $10–$100, live, persisted to Redis. Flip `EDGE_SCALING=true`
   to let strong signals scale from the slider value up toward the ceiling.
+- **Slot toggle**, 1–5 concurrent positions, live, persisted to Redis. The cells
+  are capacity; the dot under each cell lights green when that slot is actually
+  holding a contract, so the control reads as both a setting and a fill gauge.
+  Lowering it never force-closes anything — it stops new entries and drains.
+
+  Note the interaction with `MAX_PER_ASSET` (default 2): five slots can only fill
+  if signals appear across at least three assets. If you want five concurrent bets
+  concentrated in fewer names, raise `MAX_PER_ASSET` too. Max exposure is
+  `slots × bet`, so 5 × $100 = $500 committed at once.
 
 `POST /api/pause` and the Pause button stop new entries; open positions still get
 managed and settled.
