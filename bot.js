@@ -15,7 +15,7 @@ function __req(name) {
   return m.exports;
 }
 
-// ═══ module: config ══════════════════════
+// ═══ module: config ═════════════════════
 __def('config', (module, exports) => {
   const num = (v, d) => (v === undefined || v === '' || isNaN(Number(v)) ? d : Number(v));
   const bool = (v, d) => (v === undefined || v === '' ? d : String(v).toLowerCase() === 'true');
@@ -141,6 +141,7 @@ __def('config', (module, exports) => {
     ORDER_STYLE: str(process.env.ORDER_STYLE, 'limit_touch'), // limit_touch | cross
     LIMIT_OFFSET_CENTS: num(process.env.LIMIT_OFFSET_CENTS, 0),
     ORDER_TTL_S: num(process.env.ORDER_TTL_S, 25),
+    ORDER_FAIL_COOLDOWN_S: num(process.env.ORDER_FAIL_COOLDOWN_S, 60),
     FEE_RATE: num(process.env.FEE_RATE, 0.07),               // Kalshi: ceil(rate*C*P*(1-P))
     SLIPPAGE_CENTS: num(process.env.SLIPPAGE_CENTS, 0.5),
 
@@ -178,7 +179,7 @@ __def('config', (module, exports) => {
   module.exports = CFG;
 });
 
-// ═══ module: log ══════════════════════
+// ═══ module: log ═════════════════════
 __def('log', (module, exports) => {
   const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
   const min = LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] || 20;
@@ -206,7 +207,7 @@ __def('log', (module, exports) => {
   };
 });
 
-// ═══ module: store ══════════════════════
+// ═══ module: store ═════════════════════
 __def('store', (module, exports) => {
   const CFG = __req('config');
 
@@ -323,7 +324,7 @@ __def('store', (module, exports) => {
   module.exports = store;
 });
 
-// ═══ module: kalshi ══════════════════════
+// ═══ module: kalshi ═════════════════════
 __def('kalshi', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -454,26 +455,34 @@ __def('kalshi', (module, exports) => {
      * priceCents is the limit for the chosen side (1..99).
      */
     /**
-     * `order_type` is no longer required and only limit orders exist. Kalshi is
-     * mid-migration to fixed-point, so send the integer-cent price alongside its
-     * `_dollars` and `_fp` equivalents — extra fields are ignored by whichever
-     * side of the migration this environment is on.
+     * Create Order (V2). The legacy /portfolio/orders path now returns 410.
+     *
+     * V2 quotes everything from the YES leg: `side` is `bid` (buy YES) or `ask`
+     * (sell YES). There is no "buy NO" — buying NO at p is economically selling
+     * YES at 1-p, so the NO leg has to be translated, not renamed.
+     *
+     *   buy  yes @ p  ->  bid @ p
+     *   buy  no  @ p  ->  ask @ 1-p
+     *   sell yes @ p  ->  ask @ p
+     *   sell no  @ p  ->  bid @ 1-p
+     *
+     * Prices are fixed-point dollar strings; counts are fixed-point strings.
      */
-    createOrder: ({ ticker, side, action, count, priceCents, clientOrderId, tif }) => {
-      const cents = Math.max(1, Math.min(99, Math.round(priceCents)));
-      const dollars = (cents / 100).toFixed(4);
+    createOrder: ({ ticker, side, action, count, priceCents, clientOrderId, tif, postOnly, stp }) => {
+      const cents = Math.max(0.01, Math.min(99.99, priceCents));
+      const bookSide = (side === 'yes') === (action === 'buy') ? 'bid' : 'ask';
+      const priceDollars = (side === 'yes' ? cents / 100 : (100 - cents) / 100).toFixed(4);
       const body = {
         ticker,
-        action,
-        side,
-        count,
-        count_fp: Number(count).toFixed(2),
         client_order_id: clientOrderId || crypto.randomUUID(),
+        side: bookSide,
+        count: Number(count).toFixed(2),
+        price: priceDollars,
+        time_in_force: tif || 'good_till_canceled',
+        self_trade_prevention_type: stp || 'taker_at_cross',
       };
-      if (side === 'yes') { body.yes_price = cents; body.yes_price_dollars = dollars; }
-      else { body.no_price = cents; body.no_price_dollars = dollars; }
-      if (tif) body.time_in_force = tif;
-      return request('POST', '/portfolio/orders', { body });
+      if (postOnly) body.post_only = true;
+      return request('POST', '/portfolio/events/orders', { body });
     },
 
     /** Batch orderbooks — up to 100 tickers in one call instead of N calls. */
@@ -482,7 +491,7 @@ __def('kalshi', (module, exports) => {
         query: { tickers: tickers.slice(0, 100).join(','), depth },
       }),
 
-    cancelOrder: id => request('DELETE', `/portfolio/orders/${encodeURIComponent(id)}`),
+    cancelOrder: id => request('DELETE', `/portfolio/events/orders/${encodeURIComponent(id)}`),
 
     order: id => request('GET', `/portfolio/orders/${encodeURIComponent(id)}`),
 
@@ -493,7 +502,7 @@ __def('kalshi', (module, exports) => {
   module.exports = kalshi;
 });
 
-// ═══ module: pricing ══════════════════════
+// ═══ module: pricing ═════════════════════
 __def('pricing', (module, exports) => {
   const CFG = __req('config');
 
@@ -639,7 +648,7 @@ __def('pricing', (module, exports) => {
   module.exports = { fairValue, feeCents, Phi, settleVarMultiplier };
 });
 
-// ═══ module: oracle ══════════════════════
+// ═══ module: oracle ═════════════════════
 __def('oracle', (module, exports) => {
   const WebSocket = require('ws');
   const CFG = __req('config');
@@ -972,7 +981,7 @@ __def('oracle', (module, exports) => {
   };
 });
 
-// ═══ module: portfolio ══════════════════════
+// ═══ module: portfolio ═════════════════════
 __def('portfolio', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -1191,7 +1200,7 @@ __def('portfolio', (module, exports) => {
   };
 });
 
-// ═══ module: strategy ══════════════════════
+// ═══ module: strategy ═════════════════════
 __def('strategy', (module, exports) => {
   const CFG = __req('config');
   const { fairValue, feeCents } = __req('pricing');
@@ -1492,7 +1501,7 @@ __def('strategy', (module, exports) => {
   module.exports = { evaluate, readBook, contractsFor, sizeUsd, FREQ };
 });
 
-// ═══ module: engine ══════════════════════
+// ═══ module: engine ═════════════════════
 __def('engine', (module, exports) => {
   const CFG = __req('config');
   const log = __req('log');
@@ -1576,6 +1585,7 @@ __def('engine', (module, exports) => {
     series: [],           // validated series
     markets: [],          // live candidate markets with last evaluation
     pending: new Map(),    // ticker -> pending live order
+    orderCooldown: new Map(),
     errors: 0,
   };
 
@@ -1743,7 +1753,11 @@ __def('engine', (module, exports) => {
 
   // --------------------------------------------------------------- order firing
 
+  const orderCooldown = new Map();
+
   async function fire(m, decision) {
+    const until = orderCooldown.get(m.ticker);
+    if (until && Date.now() < until) return null;
     const c = decision.candidate;
     const feeUsd = feeCents(c.contracts, c.price / 100) / 100;
 
@@ -1783,6 +1797,7 @@ __def('engine', (module, exports) => {
     // c.price already reflects the order style, so post exactly what we priced.
     const limit = Math.max(1, Math.min(99, c.price + CFG.LIMIT_OFFSET_CENTS));
 
+    const passive = c.entry !== 'cross';
     try {
       const res = await kalshi.createOrder({
         ticker: m.ticker,
@@ -1790,17 +1805,40 @@ __def('engine', (module, exports) => {
         action: 'buy',
         count: c.contracts,
         priceCents: Math.max(1, Math.min(99, limit)),
+        // post_only guarantees we never cross and never pay a taker fee; if it
+        // would take, Kalshi cancels it instead of filling us at a worse price.
+        postOnly: passive,
       });
       const order = res.order || res;
-      runtime.pending.set(m.ticker, {
-        orderId: order.order_id, placedAt: Date.now(), base, limit,
-      });
-      log.info(`ORDER ${m.ticker} ${c.side} x${c.contracts} @ ${limit}¢ (id ${order.order_id})`);
+      const filled = Number(order.fill_count ?? 0);
+      const orderId = order.order_id;
+
+      if (filled > 0) {
+        const px = order.average_fill_price != null
+          ? avgFillToSideCents(c.side, order.average_fill_price)
+          : limit;
+        await pf.open({ ...base, contracts: filled, price: px, orderId, paper: false,
+          feeUsd: Number(order.average_fee_paid || 0) * filled });
+        log.info(`FILL ${m.ticker} ${c.side} x${filled} @ ${px.toFixed(1)}¢ (id ${orderId})`);
+      } else if (orderId) {
+        runtime.pending.set(m.ticker, { orderId, placedAt: Date.now(), base, limit });
+        log.info(`ORDER ${m.ticker} ${c.side} x${c.contracts} @ ${limit}¢ resting (id ${orderId})`);
+      }
+      orderCooldown.delete(m.ticker);
     } catch (e) {
       runtime.errors += 1;
+      // Back off this market so a systemic rejection doesn't hammer the endpoint
+      // dozens of times a minute the way the v1 410 did.
+      orderCooldown.set(m.ticker, Date.now() + CFG.ORDER_FAIL_COOLDOWN_S * 1000);
       log.error(`order failed ${m.ticker}: ${e.message}`);
     }
     return null;
+  }
+
+  /** V2 reports the YES-leg fill price; convert back to the side we traded. */
+  function avgFillToSideCents(side, avgDollars) {
+    const yesCents = Number(avgDollars) * 100;
+    return side === 'yes' ? yesCents : 100 - yesCents;
   }
 
   async function reconcilePending() {
@@ -1808,9 +1846,12 @@ __def('engine', (module, exports) => {
       try {
         const res = await kalshi.order(p.orderId);
         const o = res.order || res;
-        const filled = Number(o.filled_count ?? o.taker_fill_count ?? 0);
-        if (filled > 0 && (o.status === 'executed' || o.remaining_count === 0)) {
-          const px = Number(o.yes_price ?? o.no_price ?? p.limit);
+        const filled = Number(o.fill_count ?? o.filled_count ?? o.taker_fill_count ?? 0);
+        const remaining = Number(o.remaining_count ?? 1);
+        if (filled > 0 && (o.status === 'executed' || remaining === 0)) {
+          const px = o.average_fill_price != null
+            ? avgFillToSideCents(p.base.side, o.average_fill_price)
+            : Number(o.yes_price ?? o.no_price ?? p.limit);
           await pf.open({
             ...p.base,
             contracts: filled,
@@ -1908,7 +1949,7 @@ __def('engine', (module, exports) => {
         try {
           await kalshi.createOrder({
             ticker: pos.ticker, side: pos.side, action: 'sell',
-            count: n, priceCents: bid, type: 'limit',
+            count: n, priceCents: bid,
           });
           await pf.close(pos.ticker, { exitPrice: bid, reason, exitFeeUsd: exitFee });
         } catch (e) {
@@ -2065,7 +2106,7 @@ __def('engine', (module, exports) => {
   module.exports = { start, runtime, setBet, setSlots, tick, discover, rejectSummary };
 });
 
-// ═══ server ═════════════════════
+// ═══ server ════════════════════
 const path = require('path');
 const express = require('express');
 const CFG = __req('config');
