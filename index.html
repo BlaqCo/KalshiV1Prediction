@@ -589,8 +589,9 @@ function renderPositions(s){
         <td>${p.asset} <span class="freq ${p.freqLabel==='15M'?'m15':''}">${p.freqLabel||'1H'}</span>
           <div class="mut" style="font-size:9px">${strikeTxt(p)}</div></td>
         <td><span class="pill ${p.side}">${p.side.toUpperCase()}</span></td>
-        <td>${p.contracts}</td><td>${p.entryPrice}¢</td>
-        <td>${p.markPrice}¢</td>
+        <td>${p.contracts}<div class="mut" style="font-size:9px">${p.orderedContracts&&p.fillFraction<1?Math.round(p.fillFraction*100)+'% fill':'full'}</div></td>
+        <td>${p.entryPrice}¢<div class="mut" style="font-size:9px">${p.tpReachable?'tp '+p.tpPrice+'¢':'tp n/a'} · sl ${p.slPrice||'—'}¢</div></td>
+        <td>${p.markPrice}¢<div class="${cls(p.pnlPct||0)}" style="font-size:9px">${p.pnlPct!=null?(p.pnlPct>=0?'+':'')+p.pnlPct.toFixed(0)+'%':''}</div></td>
         <td class="${cls(p.unrealizedUsd||0)}">${sgn(p.unrealizedUsd||0)}</td>
         <td class="up">${p.edgeCents.toFixed(1)}¢</td>
         <td class="${tau<180?'down':''}">${clock(tau)}</td></tr>`+detailRow('p:'+p.ticker,p,8);
@@ -621,6 +622,7 @@ function detailRow(key,t,span){
       ${cell('DRIFT USED',fv.driftBps!=null?fv.driftBps.toFixed(1)+'bp':'—')}
       ${cell('FLOW TILT',fv.tiltBps!=null?fv.tiltBps.toFixed(1)+'bp':'—')}
       ${cell('STAKE',money(t.costUsd))}
+      ${t.fillFraction!=null?cell('FILL',Math.round(t.fillFraction*100)+'% of '+t.orderedContracts):''}
       ${cell('ENTRY FEE',money(t.feeUsd||0))}
       ${cell('EDGE AT ENTRY',t.edgeCents.toFixed(2)+'¢ @'+(t.entryStyle||'cross'))}
       ${t.edgeCross!=null?cell('IF CROSSED',t.edgeCross.toFixed(2)+'¢'):''}
