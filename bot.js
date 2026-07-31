@@ -15,7 +15,7 @@ function __req(name) {
   return m.exports;
 }
 
-// ═══ module: config ══════════════════
+// ═══ module: config ═════════════════
 __def('config', (module, exports) => {
   const num = (v, d) => (v === undefined || v === '' || isNaN(Number(v)) ? d : Number(v));
   const bool = (v, d) => (v === undefined || v === '' ? d : String(v).toLowerCase() === 'true');
@@ -62,7 +62,9 @@ __def('config', (module, exports) => {
       .split(',').map(s => s.trim().toLowerCase()).filter(Boolean),
     MIN_VENUES: num(process.env.MIN_VENUES, 2),           // below this, asset is untradeable
     MAX_VENUE_DISPERSION_BPS: num(process.env.MAX_VENUE_DISPERSION_BPS, 12),
-    STALE_TICK_MS: num(process.env.STALE_TICK_MS, 6000),
+    // Quiet venues don't print every few seconds overnight. 6s marked healthy
+    // feeds as dead and dropped the venue count below quorum.
+    STALE_TICK_MS: num(process.env.STALE_TICK_MS, 30000),
     // Half-life of the index's own TWAP smoothing. CF RTIs lag venue spot ~8-14s.
     INDEX_LAG_HALFLIFE_S: num(process.env.INDEX_LAG_HALFLIFE_S, 9),
     COINBASE_MAKER_SIDE: bool(process.env.COINBASE_MAKER_SIDE, true),
@@ -168,8 +170,20 @@ __def('config', (module, exports) => {
     // 100c, so +65% is only reachable from an entry below 60.6c. Above that the
     // TP can never trigger and the position rides to settlement — which is the
     // correct outcome anyway, since settlement costs no fee.
-    TAKE_PROFIT_PCT: num(process.env.TAKE_PROFIT_PCT, 0.65),
-    STOP_LOSS_PCT: num(process.env.STOP_LOSS_PCT, 0.50),
+    TAKE_PROFIT_PCT: num(process.env.TAKE_PROFIT_PCT, 0.70),
+    STOP_LOSS_PCT: num(process.env.STOP_LOSS_PCT, 0.55),
+
+    // TP_BASIS decides what the take-profit percentage is a percentage OF:
+    //
+    //   'cost'     — % of what you paid.  entry 70c, +70% -> exit at 119c.
+    //                Impossible above 58.8c, so it never fires on expensive
+    //                contracts. Correct if you think in return-on-capital.
+    //
+    //   'max_gain' — % of the profit still available. entry 70c can rise 30c at
+    //                most, so +70% -> exit at 91c. Reachable at every price, and
+    //                it means the same thing at 60c as at 80c: "take most of what
+    //                this trade can give me and stop risking the rest".
+    TP_BASIS: str(process.env.TP_BASIS, 'max_gain'),
     TAKE_PROFIT_CENTS: num(process.env.TAKE_PROFIT_CENTS, 99),
     STOP_EDGE_CENTS: num(process.env.STOP_EDGE_CENTS, -6),   // exit if edge inverts this far
     HOLD_TO_SETTLE_Z: num(process.env.HOLD_TO_SETTLE_Z, 1.6),// deep ITM: ride it out
@@ -203,7 +217,7 @@ __def('config', (module, exports) => {
   module.exports = CFG;
 });
 
-// ═══ module: log ══════════════════
+// ═══ module: log ═════════════════
 __def('log', (module, exports) => {
   const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
   const min = LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] || 20;
@@ -231,7 +245,7 @@ __def('log', (module, exports) => {
   };
 });
 
-// ═══ module: store ══════════════════
+// ═══ module: store ═════════════════
 __def('store', (module, exports) => {
   const CFG = __req('config');
 
@@ -348,7 +362,7 @@ __def('store', (module, exports) => {
   module.exports = store;
 });
 
-// ═══ module: kalshi ══════════════════
+// ═══ module: kalshi ═════════════════
 __def('kalshi', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -526,7 +540,7 @@ __def('kalshi', (module, exports) => {
   module.exports = kalshi;
 });
 
-// ═══ module: pricing ══════════════════
+// ═══ module: pricing ═════════════════
 __def('pricing', (module, exports) => {
   const CFG = __req('config');
 
@@ -672,7 +686,7 @@ __def('pricing', (module, exports) => {
   module.exports = { fairValue, feeCents, Phi, settleVarMultiplier };
 });
 
-// ═══ module: oracle ══════════════════
+// ═══ module: oracle ═════════════════
 __def('oracle', (module, exports) => {
   const WebSocket = require('ws');
   const CFG = __req('config');
@@ -1005,7 +1019,7 @@ __def('oracle', (module, exports) => {
   };
 });
 
-// ═══ module: portfolio ══════════════════
+// ═══ module: portfolio ═════════════════
 __def('portfolio', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -1252,7 +1266,7 @@ __def('portfolio', (module, exports) => {
   };
 });
 
-// ═══ module: strategy ══════════════════
+// ═══ module: strategy ═════════════════
 __def('strategy', (module, exports) => {
   const CFG = __req('config');
   const { fairValue, feeCents } = __req('pricing');
@@ -1555,7 +1569,7 @@ __def('strategy', (module, exports) => {
   module.exports = { evaluate, readBook, contractsFor, sizeUsd, FREQ };
 });
 
-// ═══ module: engine ══════════════════
+// ═══ module: engine ═════════════════
 __def('engine', (module, exports) => {
   const CFG = __req('config');
   const log = __req('log');
@@ -1809,7 +1823,7 @@ __def('engine', (module, exports) => {
 
   // --------------------------------------------------------------- order firing
 
-  const BUILD = '2026-07-30-failopen-heartbeat';
+  const BUILD = '2026-07-31-rawbook-log';
   const orderCooldown = new Map();
 
   async function fire(m, decision) {
@@ -2070,14 +2084,20 @@ __def('engine', (module, exports) => {
       const pSide = fv ? (pos.side === 'yes' ? fv.p : 1 - fv.p) : null;
       const liveEdge = pSide != null ? pSide * 100 - bid : null;
 
-      // Percentage of cost, measured against the price we could sell into now.
+      // Both measured against the price we could actually sell into right now.
       const pnlPct = (bid - pos.entryPrice) / pos.entryPrice;
-      const tpPrice = pos.entryPrice * (1 + CFG.TAKE_PROFIT_PCT);
+      const headroom = Math.max(1, 100 - pos.entryPrice);       // most it can still gain
+      const tpPrice = CFG.TP_BASIS === 'cost'
+        ? pos.entryPrice * (1 + CFG.TAKE_PROFIT_PCT)
+        : pos.entryPrice + headroom * CFG.TAKE_PROFIT_PCT;
       const slPrice = pos.entryPrice * (1 - CFG.STOP_LOSS_PCT);
+      const capturedPct = (bid - pos.entryPrice) / headroom;    // share of available profit
 
       let reason = null;
       if (CFG.FLATTEN_BEFORE_CLOSE_S > 0 && tau <= CFG.FLATTEN_BEFORE_CLOSE_S) reason = 'flatten';
-      else if (pnlPct >= CFG.TAKE_PROFIT_PCT) reason = `take profit +${(pnlPct * 100).toFixed(0)}%`;
+      else if (bid >= tpPrice) reason = CFG.TP_BASIS === 'cost'
+        ? `take profit +${(pnlPct * 100).toFixed(0)}% of cost`
+        : `take profit ${(capturedPct * 100).toFixed(0)}% of available`;
       else if (pnlPct <= -CFG.STOP_LOSS_PCT) reason = `stop loss ${(pnlPct * 100).toFixed(0)}%`;
       else if (bid - pos.entryPrice >= CFG.TAKE_PROFIT_CENTS) reason = 'take profit';
       else if (liveEdge != null && liveEdge <= CFG.STOP_EDGE_CENTS
@@ -2085,6 +2105,7 @@ __def('engine', (module, exports) => {
       pos.tpPrice = Math.min(99, Math.round(tpPrice * 10) / 10);
       pos.slPrice = Math.round(slPrice * 10) / 10;
       pos.tpReachable = tpPrice <= 99;
+      pos.tpBasis = CFG.TP_BASIS;
       pos.pnlPct = pnlPct * 100;
 
       if (!reason) continue;
@@ -2207,6 +2228,21 @@ __def('engine', (module, exports) => {
     runtime.markets = view;
     runtime.lastScanAt = Date.now();
     runtime.lastScanMs = Date.now() - t0;
+
+    // If every single book parses as empty, that is almost certainly a response
+    // format we don't recognise rather than a genuinely empty exchange. Dump one
+    // verbatim payload to the log so the shape is visible without the dashboard.
+    const anyBook = view.some(v => v.book && v.book.yesBid != null);
+    if (view.length >= 5 && !anyBook) {
+      runtime.emptyBookScans = (runtime.emptyBookScans || 0) + 1;
+      if (runtime.emptyBookScans === 3 || runtime.emptyBookScans % 200 === 0) {
+        const sample = runtime.rawBook;
+        log.warn(`ALL ${view.length} books parsed empty — raw payload for ${sample?.ticker}: `
+          + JSON.stringify(sample?.raw).slice(0, 500));
+      }
+    } else {
+      runtime.emptyBookScans = 0;
+    }
 
     heartbeat(view);
   }
@@ -2335,7 +2371,7 @@ __def('engine', (module, exports) => {
   module.exports = { start, runtime, setBet, setSlots, tick, discover, rejectSummary };
 });
 
-// ═══ server ════════════════
+// ═══ server ═══════════════
 const path = require('path');
 const express = require('express');
 const CFG = __req('config');
@@ -2409,6 +2445,7 @@ app.get('/api/state', (req, res) => {
     balanceUsd: engine.runtime.balanceUsd,
     exits: {
       takeProfitPct: CFG.TAKE_PROFIT_PCT * 100,
+      tpBasis: CFG.TP_BASIS,
       stopLossPct: CFG.STOP_LOSS_PCT * 100,
       tpReachableBelowCents: Math.floor(10000 / (1 + CFG.TAKE_PROFIT_PCT)) / 100,
       minFillFraction: CFG.MIN_FILL_FRACTION,
