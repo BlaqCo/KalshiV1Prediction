@@ -15,7 +15,7 @@ function __req(name) {
   return m.exports;
 }
 
-// ═══ module: config ═════════════════
+// ═══ module: config ════════════════
 __def('config', (module, exports) => {
   const num = (v, d) => (v === undefined || v === '' || isNaN(Number(v)) ? d : Number(v));
   const bool = (v, d) => (v === undefined || v === '' ? d : String(v).toLowerCase() === 'true');
@@ -217,7 +217,7 @@ __def('config', (module, exports) => {
   module.exports = CFG;
 });
 
-// ═══ module: log ═════════════════
+// ═══ module: log ════════════════
 __def('log', (module, exports) => {
   const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
   const min = LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] || 20;
@@ -245,7 +245,7 @@ __def('log', (module, exports) => {
   };
 });
 
-// ═══ module: store ═════════════════
+// ═══ module: store ════════════════
 __def('store', (module, exports) => {
   const CFG = __req('config');
 
@@ -362,7 +362,7 @@ __def('store', (module, exports) => {
   module.exports = store;
 });
 
-// ═══ module: kalshi ═════════════════
+// ═══ module: kalshi ════════════════
 __def('kalshi', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -540,7 +540,7 @@ __def('kalshi', (module, exports) => {
   module.exports = kalshi;
 });
 
-// ═══ module: pricing ═════════════════
+// ═══ module: pricing ════════════════
 __def('pricing', (module, exports) => {
   const CFG = __req('config');
 
@@ -686,7 +686,7 @@ __def('pricing', (module, exports) => {
   module.exports = { fairValue, feeCents, Phi, settleVarMultiplier };
 });
 
-// ═══ module: oracle ═════════════════
+// ═══ module: oracle ════════════════
 __def('oracle', (module, exports) => {
   const WebSocket = require('ws');
   const CFG = __req('config');
@@ -1019,7 +1019,7 @@ __def('oracle', (module, exports) => {
   };
 });
 
-// ═══ module: portfolio ═════════════════
+// ═══ module: portfolio ════════════════
 __def('portfolio', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -1266,7 +1266,7 @@ __def('portfolio', (module, exports) => {
   };
 });
 
-// ═══ module: strategy ═════════════════
+// ═══ module: strategy ════════════════
 __def('strategy', (module, exports) => {
   const CFG = __req('config');
   const { fairValue, feeCents } = __req('pricing');
@@ -1347,9 +1347,13 @@ __def('strategy', (module, exports) => {
   }
 
   function readBook(ob) {
-    const book = ob?.orderbook ?? ob ?? {};
-    const rawYes = book.yes ?? book.yes_levels ?? [];
-    const rawNo = book.no ?? book.no_levels ?? [];
+    // Kalshi's finer-tick rollout (from 2026-07-27) moved production books to a
+    // new container and new key names. Demo still serves the legacy shape, so both
+    // have to work. Observed production payload:
+    //   {"orderbook_fp":{"yes_dollars":[["0.3500","1520.00"]], "no_dollars":[...]}}
+    const book = ob?.orderbook_fp ?? ob?.orderbook ?? ob ?? {};
+    const rawYes = book.yes_dollars ?? book.yes ?? book.yes_levels ?? [];
+    const rawNo = book.no_dollars ?? book.no ?? book.no_levels ?? [];
     // one decision for both sides — they always share a format
     const dollars = detectDollars([...(rawYes || []), ...(rawNo || [])]);
     const yes = normaliseLevels(rawYes, dollars);
@@ -1569,7 +1573,7 @@ __def('strategy', (module, exports) => {
   module.exports = { evaluate, readBook, contractsFor, sizeUsd, FREQ };
 });
 
-// ═══ module: engine ═════════════════
+// ═══ module: engine ════════════════
 __def('engine', (module, exports) => {
   const CFG = __req('config');
   const log = __req('log');
@@ -1823,7 +1827,7 @@ __def('engine', (module, exports) => {
 
   // --------------------------------------------------------------- order firing
 
-  const BUILD = '2026-07-31-rawbook-log';
+  const BUILD = '2026-07-30-failopen-heartbeat';
   const orderCooldown = new Map();
 
   async function fire(m, decision) {
@@ -2371,7 +2375,7 @@ __def('engine', (module, exports) => {
   module.exports = { start, runtime, setBet, setSlots, tick, discover, rejectSummary };
 });
 
-// ═══ server ═══════════════
+// ═══ server ══════════════
 const path = require('path');
 const express = require('express');
 const CFG = __req('config');
