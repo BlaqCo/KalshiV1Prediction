@@ -1,8 +1,13 @@
 'use strict';
 /**
  * 0XBLAQ · KALSHI ENGINE — single-file build
- *   ARB_MODE=false  pricing model
- *   ARB_MODE=true   model-free arbitrage scanner
+ *
+ * Three modes, selected by env:
+ *   default          pricing model, trades
+ *   ARB_MODE=true    model-free arbitrage scanner
+ *   PREDICT_MODE=true  prediction ledger — measures the model, never trades
+ *
+ * Search `=== module: name ===` to jump around.
  */
 
 const __registry = {};
@@ -16,7 +21,7 @@ function __req(name) {
   return m.exports;
 }
 
-// ═══ module: config ═══════════════
+// ═══ module: config ══════════════
 __def('config', (module, exports) => {
   const num = (v, d) => (v === undefined || v === '' || isNaN(Number(v)) ? d : Number(v));
   const bool = (v, d) => (v === undefined || v === '' ? d : String(v).toLowerCase() === 'true');
@@ -147,6 +152,15 @@ __def('config', (module, exports) => {
     // very large batches risk hitting URL length limits.
     ARB_BATCH_SIZE: num(process.env.ARB_BATCH_SIZE, 40),
 
+    // ---------- prediction ledger ----------
+    // Records model vs market probability at a FIXED horizon, scores both against
+    // settlement. Never trades. This is how we find out whether the model knows
+    // anything before any capital is committed to it.
+    PREDICT_MODE: bool(process.env.PREDICT_MODE, false),
+    PREDICT_HORIZON_S: num(process.env.PREDICT_HORIZON_S, 300),
+    PREDICT_HORIZON_TOLERANCE_S: num(process.env.PREDICT_HORIZON_TOLERANCE_S, 30),
+    PREDICT_MIN_SAMPLE: num(process.env.PREDICT_MIN_SAMPLE, 200),
+
     // When a market has no offer at all, post our own price and become the book
     // rather than skipping it. Priced at fair minus the target edge. This is how
     // you actually trade thin books — but see the paper-fill caveat in the README.
@@ -246,7 +260,7 @@ __def('config', (module, exports) => {
   module.exports = CFG;
 });
 
-// ═══ module: log ═══════════════
+// ═══ module: log ══════════════
 __def('log', (module, exports) => {
   const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
   const min = LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] || 20;
@@ -274,7 +288,7 @@ __def('log', (module, exports) => {
   };
 });
 
-// ═══ module: store ═══════════════
+// ═══ module: store ══════════════
 __def('store', (module, exports) => {
   const CFG = __req('config');
 
@@ -391,7 +405,7 @@ __def('store', (module, exports) => {
   module.exports = store;
 });
 
-// ═══ module: kalshi ═══════════════
+// ═══ module: kalshi ══════════════
 __def('kalshi', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -579,7 +593,7 @@ __def('kalshi', (module, exports) => {
   module.exports = kalshi;
 });
 
-// ═══ module: pricing ═══════════════
+// ═══ module: pricing ══════════════
 __def('pricing', (module, exports) => {
   const CFG = __req('config');
 
@@ -726,7 +740,7 @@ __def('pricing', (module, exports) => {
   module.exports = { fairValue, feeCents, Phi, settleVarMultiplier };
 });
 
-// ═══ module: oracle ═══════════════
+// ═══ module: oracle ══════════════
 __def('oracle', (module, exports) => {
   const WebSocket = require('ws');
   const CFG = __req('config');
@@ -1074,7 +1088,7 @@ __def('oracle', (module, exports) => {
   };
 });
 
-// ═══ module: portfolio ═══════════════
+// ═══ module: portfolio ══════════════
 __def('portfolio', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -1321,7 +1335,7 @@ __def('portfolio', (module, exports) => {
   };
 });
 
-// ═══ module: strategy ═══════════════
+// ═══ module: strategy ══════════════
 __def('strategy', (module, exports) => {
   const CFG = __req('config');
   const { fairValue, feeCents } = __req('pricing');
@@ -1644,7 +1658,7 @@ __def('strategy', (module, exports) => {
   module.exports = { evaluate, readBook, contractsFor, sizeUsd, FREQ };
 });
 
-// ═══ module: arb ═══════════════
+// ═══ module: arb ══════════════
 __def('arb', (module, exports) => {
   /**
    * Model-free arbitrage scanner.
@@ -1838,7 +1852,205 @@ __def('arb', (module, exports) => {
   module.exports = { scan, findParity, findLadder, touch, legFee };
 });
 
-// ═══ module: engine ═══════════════
+// ═══ module: predict ══════════════
+__def('predict', (module, exports) => {
+  /**
+   * Prediction ledger — the measurement instrument.
+   *
+   * This module never trades. It records what the model believed, what the market
+   * believed, and what actually happened, then scores both.
+   *
+   * The reason it exists: every failure in this project shared a shape. A broken
+   * component produced plausible-looking output, and we tuned around it for hours
+   * without noticing. A volatility estimate that was 19x too high still produced
+   * confident probabilities; nothing in the trading path could tell the difference.
+   *
+   * A calibration curve can. If the model says 70% and those events happen 45% of
+   * the time, that is visible within a day and no amount of threshold tuning hides
+   * it. And if the model is calibrated but no better than the market's own price,
+   * that is visible too — which is the difference between "the model works" and
+   * "the model is worth money".
+   *
+   * Two scores, both proper:
+   *
+   *   BRIER   mean squared error of the probability. Lower is better. Comparing
+   *           model Brier against market Brier answers "do we know something the
+   *           price does not", which is the only question that matters.
+   *
+   *   LOG     mean log loss. Punishes confident mistakes far harder than Brier,
+   *           so it surfaces exactly the overconfident-tails failure that the
+   *           broken sigma produced.
+   */
+
+  const CFG = __req('config');
+  const log = __req('log');
+  const store = __req('store');
+
+  const KEY = 'predictions';
+  const BUCKETS = [
+    [0.00, 0.10], [0.10, 0.20], [0.20, 0.30], [0.30, 0.40], [0.40, 0.50],
+    [0.50, 0.60], [0.60, 0.70], [0.70, 0.80], [0.80, 0.90], [0.90, 1.01],
+  ];
+
+  const P = {
+    open: new Map(),     // ticker -> forecast awaiting settlement
+    settled: [],         // scored forecasts, newest first
+    loaded: false,
+  };
+
+  async function hydrate() {
+    try {
+      const saved = await store.get(KEY);
+      if (saved) {
+        P.settled = saved.settled || [];
+        for (const row of saved.open || []) P.open.set(row.ticker, row);
+        log.info(`predictions: ${P.settled.length} settled, ${P.open.size} awaiting`);
+      }
+    } catch (e) { log.debug(`prediction hydrate failed: ${e.message}`); }
+    P.loaded = true;
+  }
+
+  async function persist() {
+    await store.set(KEY, {
+      settled: P.settled.slice(0, 3000),
+      open: [...P.open.values()],
+    }).catch(() => {});
+  }
+
+  /**
+   * Record a forecast once per market, at a fixed horizon before close.
+   *
+   * The fixed horizon matters more than it looks. If we recorded whenever a market
+   * happened to be scanned, markets that stay interesting longer would contribute
+   * more observations, and the sample would be biased toward whatever the engine
+   * finds attractive. One observation per market at the same tau makes the sample
+   * a clean cross-section.
+   */
+  function record({ market, modelP, marketP, tau, asset, sigmaBps, z, freq }) {
+    if (!Number.isFinite(modelP) || !Number.isFinite(marketP)) return;
+    if (P.open.has(market.ticker)) return;
+
+    const target = CFG.PREDICT_HORIZON_S;
+    if (Math.abs(tau - target) > CFG.PREDICT_HORIZON_TOLERANCE_S) return;
+
+    P.open.set(market.ticker, {
+      ticker: market.ticker,
+      asset,
+      freq: freq || '1H',
+      closeTime: market.close_time,
+      recordedAt: Date.now(),
+      tau: Math.round(tau),
+      modelP: Number(modelP.toFixed(4)),
+      marketP: Number(marketP.toFixed(4)),
+      sigmaBps: sigmaBps != null ? Number(sigmaBps.toFixed(2)) : null,
+      z: z != null ? Number(z.toFixed(3)) : null,
+      floorStrike: market.floor_strike ?? null,
+      capStrike: market.cap_strike ?? null,
+    });
+  }
+
+  /** Score a forecast once the real outcome is known. */
+  function settle(ticker, outcomeYes) {
+    const row = P.open.get(ticker);
+    if (!row) return null;
+    P.open.delete(ticker);
+
+    const y = outcomeYes ? 1 : 0;
+    const clamp = p => Math.min(0.999, Math.max(0.001, p));
+    const scored = {
+      ...row,
+      settledAt: Date.now(),
+      outcome: y,
+      modelBrier: Math.pow(row.modelP - y, 2),
+      marketBrier: Math.pow(row.marketP - y, 2),
+      modelLog: -Math.log(y ? clamp(row.modelP) : 1 - clamp(row.modelP)),
+      marketLog: -Math.log(y ? clamp(row.marketP) : 1 - clamp(row.marketP)),
+    };
+    P.settled.unshift(scored);
+    if (P.settled.length > 3000) P.settled.pop();
+    return scored;
+  }
+
+  /**
+   * Calibration and skill.
+   *
+   * `edge` is the model's Brier subtracted from the market's: positive means the
+   * model is closer to the truth than the price is, which is the precondition for
+   * any of this being worth money. A calibrated model with zero edge is a correct
+   * model with no business case.
+   */
+  function stats() {
+    const s = P.settled;
+    const n = s.length;
+    if (!n) return { n: 0, awaiting: P.open.size, buckets: [], ready: false };
+
+    const mean = f => s.reduce((a, r) => a + f(r), 0) / n;
+    const modelBrier = mean(r => r.modelBrier);
+    const marketBrier = mean(r => r.marketBrier);
+    const base = mean(r => r.outcome);
+
+    const buckets = BUCKETS.map(([lo, hi]) => {
+      const inBucket = s.filter(r => r.modelP >= lo && r.modelP < hi);
+      const k = inBucket.length;
+      return {
+        range: `${Math.round(lo * 100)}-${Math.round(hi * 100)}%`,
+        n: k,
+        predicted: k ? inBucket.reduce((a, r) => a + r.modelP, 0) / k : 0,
+        actual: k ? inBucket.reduce((a, r) => a + r.outcome, 0) / k : 0,
+        marketPredicted: k ? inBucket.reduce((a, r) => a + r.marketP, 0) / k : 0,
+      };
+    }).filter(b => b.n > 0);
+
+    const byAsset = {};
+    for (const r of s) {
+      const a = byAsset[r.asset] || { n: 0, model: 0, market: 0 };
+      a.n += 1; a.model += r.modelBrier; a.market += r.marketBrier;
+      byAsset[r.asset] = a;
+    }
+    for (const a of Object.values(byAsset)) {
+      a.modelBrier = a.model / a.n; a.marketBrier = a.market / a.n;
+      a.edge = a.marketBrier - a.modelBrier;
+      delete a.model; delete a.market;
+    }
+
+    // Reference point: always predicting the base rate. A model that cannot beat
+    // this is not a model.
+    const climatology = mean(r => Math.pow(base - r.outcome, 2));
+
+    return {
+      n, awaiting: P.open.size,
+      ready: n >= CFG.PREDICT_MIN_SAMPLE,
+      baseRate: base,
+      modelBrier, marketBrier, climatology,
+      edge: marketBrier - modelBrier,
+      modelLog: mean(r => r.modelLog),
+      marketLog: mean(r => r.marketLog),
+      buckets, byAsset,
+      verdict: verdict(n, marketBrier - modelBrier, modelBrier, climatology),
+    };
+  }
+
+  /** Plain-language read, so the numbers cannot be wishfully interpreted. */
+  function verdict(n, edge, modelBrier, climatology) {
+    if (n < CFG.PREDICT_MIN_SAMPLE) {
+      return `collecting — ${n}/${CFG.PREDICT_MIN_SAMPLE} settled, too early to judge`;
+    }
+    if (modelBrier >= climatology) {
+      return 'model is WORSE than always guessing the base rate — no signal';
+    }
+    if (edge <= 0) {
+      return 'model is calibrated but NOT better than the market price — no edge to trade';
+    }
+    if (edge < 0.005) {
+      return `model beats the market by ${(edge * 1000).toFixed(1)}/1000 Brier — real but too thin for fees`;
+    }
+    return `model beats the market by ${(edge * 1000).toFixed(1)}/1000 Brier — worth sizing into`;
+  }
+
+  module.exports = { hydrate, record, settle, stats, persist, P };
+});
+
+// ═══ module: engine ══════════════
 __def('engine', (module, exports) => {
   const CFG = __req('config');
   const log = __req('log');
@@ -1847,6 +2059,7 @@ __def('engine', (module, exports) => {
   const pf = __req('portfolio');
   const { evaluate, readBook, FREQ } = __req('strategy');
   const arb = __req('arb');
+  const predict = __req('predict');
   const { feeCents, fairValue } = __req('pricing');
   const store = __req('store');
 
@@ -2093,7 +2306,87 @@ __def('engine', (module, exports) => {
 
   // --------------------------------------------------------------- order firing
 
-  const BUILD = '2026-08-01-arb-batchfix';
+  const BUILD = '2026-07-31-arb';
+
+  /**
+   * Prediction tick. Prices every market the model can price, records the forecast
+   * at a fixed horizon, and settles matured forecasts against the real outcome.
+   * Places no orders under any circumstances.
+   */
+  async function predictTick(t0) {
+    await discover();
+    const markets = marketCache || [];
+
+    // settle anything that has closed since the last pass
+    await settlePredictions();
+
+    let recorded = 0;
+    for (const m of markets) {
+      const o = oracle.get(m._asset);
+      if (!o || !(o.composite > 0) || !(o.sigma > 0)) continue;
+      const F = m._freq || FREQ.hourly;
+      const tau = (Date.parse(m.close_time) - Date.now()) / 1000;
+      if (Math.abs(tau - CFG.PREDICT_HORIZON_S) > CFG.PREDICT_HORIZON_TOLERANCE_S) continue;
+
+      const K = m._strikes || { floor: m.floor_strike, cap: m.cap_strike };
+      const fv = fairValue(o, {
+        floorStrike: K.floor, capStrike: K.cap,
+        settleWindow: F.settleWindow, tau,
+      });
+      if (!fv) continue;
+
+      // The market's own probability is the mid of its book — the price we would
+      // have to beat. Without a two-sided book there is nothing to compare against.
+      const ob = await kalshi.orderbook(m.ticker, 1).catch(() => null);
+      const book = readBook(ob);
+      if (book.yesBid == null || book.yesAsk == null) continue;
+      const marketP = (book.yesBid + book.yesAsk) / 200;
+
+      predict.record({
+        market: m, modelP: fv.p, marketP, tau, asset: m._asset,
+        sigmaBps: fv.sigmaEffBps, z: fv.z, freq: F.label,
+      });
+      recorded += 1;
+    }
+
+    if (recorded) await predict.persist();
+    predictHeartbeat(markets.length, recorded);
+    runtime.lastScanAt = Date.now();
+    runtime.lastScanMs = Date.now() - t0;
+  }
+
+  /** Resolve matured forecasts using the exchange's own settlement result. */
+  async function settlePredictions() {
+    const now = Date.now();
+    for (const row of [...predict.P.open.values()]) {
+      if (Date.parse(row.closeTime) > now - 60000) continue;   // give it a minute
+      try {
+        const res = await kalshi.market(row.ticker);
+        const mk = res.market || res;
+        if (mk.status !== 'settled' && mk.status !== 'finalized') continue;
+        const yes = String(mk.result || '').toLowerCase() === 'yes';
+        const scored = predict.settle(row.ticker, yes);
+        if (scored) {
+          log.info(`PREDICT settled ${row.asset} ${row.ticker} -> ${yes ? 'YES' : 'NO'} `
+            + `| model ${(row.modelP * 100).toFixed(0)}% market ${(row.marketP * 100).toFixed(0)}%`);
+        }
+      } catch (e) { /* not resolved yet; try next pass */ }
+    }
+    await predict.persist();
+  }
+
+  function predictHeartbeat(nMarkets, recorded) {
+    runtime.sinceHeartbeat = (runtime.sinceHeartbeat || 0) + 1;
+    if (runtime.sinceHeartbeat < CFG.HEARTBEAT_SCANS) return;
+    runtime.sinceHeartbeat = 0;
+    const st = predict.stats();
+    log.info(`predict: ${nMarkets} markets, ${recorded} recorded this scan, `
+      + `${st.awaiting} awaiting settlement, ${st.n} scored`);
+    if (st.n) {
+      log.info(`  model Brier ${st.modelBrier.toFixed(4)} vs market ${st.marketBrier.toFixed(4)} `
+        + `(base rate ${st.climatology.toFixed(4)}) — ${st.verdict}`);
+    }
+  }
 
   /**
    * Arbitrage tick. Fetches WHOLE ladders (batched, 100 tickers per call) because
@@ -2579,6 +2872,7 @@ __def('engine', (module, exports) => {
     runtime.scans += 1;
     await refreshBalance();
     if (CFG.ARB_MODE) return arbTick(t0);
+    if (CFG.PREDICT_MODE) return predictTick(t0);
 
     if (Date.now() - lastDiscovery > 45000) await discover();
 
@@ -2726,6 +3020,7 @@ __def('engine', (module, exports) => {
   async function start() {
     oracle.start();
     await pf.hydrate();
+    await predict.hydrate();
 
     if (!kalshi.configured()) {
       log.error('KALSHI_KEY_ID / KALSHI_PRIVATE_KEY missing — engine idle, oracle still live');
@@ -2784,13 +3079,14 @@ __def('engine', (module, exports) => {
   module.exports = { start, runtime, setBet, setSlots, tick, discover, rejectSummary };
 });
 
-// ═══ server ═════════════
+// ═══ server ════════════
 const path = require('path');
 const express = require('express');
 const CFG = __req('config');
 const log = __req('log');
 const oracle = __req('oracle');
 const engine = __req('engine');
+const predict = __req('predict');
 const pf = __req('portfolio');
 const kalshi = __req('kalshi');
 const store = __req('store');
@@ -2855,6 +3151,7 @@ app.get('/api/state', (req, res) => {
     rawBook: engine.runtime.rawBook,
     rawFill: engine.runtime.rawFill,
     rawBalance: engine.runtime.rawBalance,
+    predict: predict.stats(),
     arb: {
       mode: CFG.ARB_MODE,
       shadow: CFG.ARB_SHADOW,
