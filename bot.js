@@ -17,7 +17,7 @@ function __req(name) {
   return m.exports;
 }
 
-// ═══ module: config ═════════════
+// ═══ module: config ════════════
 __def('config', (module, exports) => {
   const num = (v, d) => (v === undefined || v === '' || isNaN(Number(v)) ? d : Number(v));
   const bool = (v, d) => (v === undefined || v === '' ? d : String(v).toLowerCase() === 'true');
@@ -263,7 +263,7 @@ __def('config', (module, exports) => {
   module.exports = CFG;
 });
 
-// ═══ module: log ═════════════
+// ═══ module: log ════════════
 __def('log', (module, exports) => {
   const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
   const min = LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] || 20;
@@ -291,7 +291,7 @@ __def('log', (module, exports) => {
   };
 });
 
-// ═══ module: store ═════════════
+// ═══ module: store ════════════
 __def('store', (module, exports) => {
   const CFG = __req('config');
 
@@ -408,7 +408,7 @@ __def('store', (module, exports) => {
   module.exports = store;
 });
 
-// ═══ module: kalshi ═════════════
+// ═══ module: kalshi ════════════
 __def('kalshi', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -596,7 +596,7 @@ __def('kalshi', (module, exports) => {
   module.exports = kalshi;
 });
 
-// ═══ module: pricing ═════════════
+// ═══ module: pricing ════════════
 __def('pricing', (module, exports) => {
   const CFG = __req('config');
 
@@ -744,7 +744,7 @@ __def('pricing', (module, exports) => {
   module.exports = { fairValue, feeCents, Phi, settleVarMultiplier };
 });
 
-// ═══ module: oracle ═════════════
+// ═══ module: oracle ════════════
 __def('oracle', (module, exports) => {
   const WebSocket = require('ws');
   const CFG = __req('config');
@@ -1092,7 +1092,7 @@ __def('oracle', (module, exports) => {
   };
 });
 
-// ═══ module: portfolio ═════════════
+// ═══ module: portfolio ════════════
 __def('portfolio', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -1339,7 +1339,7 @@ __def('portfolio', (module, exports) => {
   };
 });
 
-// ═══ module: strategy ═════════════
+// ═══ module: strategy ════════════
 __def('strategy', (module, exports) => {
   const CFG = __req('config');
   const { fairValue, feeCents } = __req('pricing');
@@ -1662,7 +1662,7 @@ __def('strategy', (module, exports) => {
   module.exports = { evaluate, readBook, contractsFor, sizeUsd, FREQ };
 });
 
-// ═══ module: arb ═════════════
+// ═══ module: arb ════════════
 __def('arb', (module, exports) => {
   /**
    * Model-free arbitrage scanner.
@@ -1856,7 +1856,7 @@ __def('arb', (module, exports) => {
   module.exports = { scan, findParity, findLadder, touch, legFee };
 });
 
-// ═══ module: predict ═════════════
+// ═══ module: predict ════════════
 __def('predict', (module, exports) => {
   /**
    * Prediction ledger — the measurement instrument.
@@ -2067,7 +2067,7 @@ __def('predict', (module, exports) => {
   module.exports = { hydrate, record, settle, stats, persist, P };
 });
 
-// ═══ module: engine ═════════════
+// ═══ module: engine ════════════
 __def('engine', (module, exports) => {
   const CFG = __req('config');
   const log = __req('log');
@@ -2323,7 +2323,7 @@ __def('engine', (module, exports) => {
 
   // --------------------------------------------------------------- order firing
 
-  const BUILD = '2026-07-31-arb';
+  const BUILD = '2026-08-01-predict-ui';
 
   /**
    * Prediction tick. Prices every market the model can price, records the forecast
@@ -2338,6 +2338,7 @@ __def('engine', (module, exports) => {
     await settlePredictions();
 
     let recorded = 0;
+    const view = [];
     for (const m of markets) {
       const o = oracle.get(m._asset);
       if (!o || !(o.composite > 0) || !(o.sigma > 0)) continue;
@@ -2363,12 +2364,36 @@ __def('engine', (module, exports) => {
       if (book.yesBid == null || book.yesAsk == null) continue;
       const marketP = (book.yesBid + book.yesAsk) / 200;
 
+      const before = predict.P.open.has(m.ticker) || predict.P.settled.some(r => r.ticker === m.ticker);
       predict.record({
         market: m, modelP: fv.p, marketP, tau, asset: m._asset,
         sigmaBps: fv.sigmaEffBps, z: fv.z, freq: F.label,
       });
-      recorded += 1;
+      if (!before && predict.P.open.has(m.ticker)) recorded += 1;
+
+      // Feed the dashboard. In predict mode the board is a comparison, not a
+      // trade list: what the market thinks, what we think, and how far apart.
+      const gapPP = (fv.p - marketP) * 100;
+      view.push({
+        ticker: m.ticker,
+        asset: m._asset,
+        freq: F.label,
+        tau: Math.round(tau),
+        strike: m._strikes?.floor ?? m.floor_strike ?? m._strikes?.cap ?? m.cap_strike ?? null,
+        direction: (m._strikes?.floor ?? m.floor_strike) != null ? 'above' : 'below',
+        spot: o.index,
+        marketPct: Math.round(marketP * 100),
+        modelPct: Math.round(fv.p * 100),
+        gapPP: Number(gapPP.toFixed(1)),
+        agree: Math.abs(gapPP) < 3,
+        lean: gapPP > 0 ? 'more likely' : 'less likely',
+        recorded: predict.P.open.has(m.ticker),
+        sigmaBps: fv.sigmaEffBps != null ? Number(fv.sigmaEffBps.toFixed(1)) : null,
+      });
     }
+    view.sort((a, b) => Math.abs(b.gapPP) - Math.abs(a.gapPP));
+    runtime.markets = view;
+    runtime.predictMode = true;
 
     if (recorded) await predict.persist();
     predictHeartbeat(markets.length, recorded);
@@ -3101,7 +3126,7 @@ __def('engine', (module, exports) => {
   module.exports = { start, runtime, setBet, setSlots, tick, discover, rejectSummary };
 });
 
-// ═══ server ═══════════
+// ═══ server ══════════
 const path = require('path');
 const express = require('express');
 const CFG = __req('config');
@@ -3174,6 +3199,7 @@ app.get('/api/state', (req, res) => {
     rawFill: engine.runtime.rawFill,
     rawBalance: engine.runtime.rawBalance,
     predict: predict.stats(),
+    predictMode: !!engine.runtime.predictMode,
     arb: {
       mode: CFG.ARB_MODE,
       shadow: CFG.ARB_SHADOW,
