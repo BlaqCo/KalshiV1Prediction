@@ -2,7 +2,7 @@
 /**
  * 0XBLAQ · KALSHI ENGINE — single-file build
  *   default            pricing model, trades
- *   ARB_MODE=true      model-free arbitrage scanner
+ *   ARB_MODE=true      arbitrage scanner
  *   PREDICT_MODE=true  prediction ledger, never trades
  */
 
@@ -17,7 +17,7 @@ function __req(name) {
   return m.exports;
 }
 
-// ═══ module: config ════════════
+// ═══ module: config ═══════════
 __def('config', (module, exports) => {
   const num = (v, d) => (v === undefined || v === '' || isNaN(Number(v)) ? d : Number(v));
   const bool = (v, d) => (v === undefined || v === '' ? d : String(v).toLowerCase() === 'true');
@@ -153,7 +153,19 @@ __def('config', (module, exports) => {
     // settlement. Never trades. This is how we find out whether the model knows
     // anything before any capital is committed to it.
     PREDICT_MODE: bool(process.env.PREDICT_MODE, false),
+    // Snapshot horizons in seconds. One row per market PER horizon, so a single
+    // hourly market contributes several observations as it ages toward settlement.
+    // This fixes two things at once: the sample fills far faster, and skill can be
+    // compared across horizons — if the model only beats the market close to the
+    // bell, that is worth knowing rather than averaging away.
+    PREDICT_HORIZONS: str(process.env.PREDICT_HORIZONS, '1800,900,300,120')
+      .split(',').map(x => Number(x.trim())).filter(x => x > 0),
     PREDICT_HORIZON_S: num(process.env.PREDICT_HORIZON_S, 300),
+    // How far below each horizon still counts as that snapshot.
+    PREDICT_SNAP_TOLERANCE_S: num(process.env.PREDICT_SNAP_TOLERANCE_S, 90),
+    // Markets within this many seconds of close are shown on the board, whether
+    // or not they are being recorded right now.
+    PREDICT_BOARD_S: num(process.env.PREDICT_BOARD_S, 2400),
     PREDICT_HORIZON_TOLERANCE_S: num(process.env.PREDICT_HORIZON_TOLERANCE_S, 30),
     // Capture band below the target horizon. Wide enough that no market slips
     // past between scans.
@@ -263,7 +275,7 @@ __def('config', (module, exports) => {
   module.exports = CFG;
 });
 
-// ═══ module: log ════════════
+// ═══ module: log ═══════════
 __def('log', (module, exports) => {
   const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
   const min = LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] || 20;
@@ -291,7 +303,7 @@ __def('log', (module, exports) => {
   };
 });
 
-// ═══ module: store ════════════
+// ═══ module: store ═══════════
 __def('store', (module, exports) => {
   const CFG = __req('config');
 
@@ -408,7 +420,7 @@ __def('store', (module, exports) => {
   module.exports = store;
 });
 
-// ═══ module: kalshi ════════════
+// ═══ module: kalshi ═══════════
 __def('kalshi', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -596,7 +608,7 @@ __def('kalshi', (module, exports) => {
   module.exports = kalshi;
 });
 
-// ═══ module: pricing ════════════
+// ═══ module: pricing ═══════════
 __def('pricing', (module, exports) => {
   const CFG = __req('config');
 
@@ -744,7 +756,7 @@ __def('pricing', (module, exports) => {
   module.exports = { fairValue, feeCents, Phi, settleVarMultiplier };
 });
 
-// ═══ module: oracle ════════════
+// ═══ module: oracle ═══════════
 __def('oracle', (module, exports) => {
   const WebSocket = require('ws');
   const CFG = __req('config');
@@ -1092,7 +1104,7 @@ __def('oracle', (module, exports) => {
   };
 });
 
-// ═══ module: portfolio ════════════
+// ═══ module: portfolio ═══════════
 __def('portfolio', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -1339,7 +1351,7 @@ __def('portfolio', (module, exports) => {
   };
 });
 
-// ═══ module: strategy ════════════
+// ═══ module: strategy ═══════════
 __def('strategy', (module, exports) => {
   const CFG = __req('config');
   const { fairValue, feeCents } = __req('pricing');
@@ -1662,7 +1674,7 @@ __def('strategy', (module, exports) => {
   module.exports = { evaluate, readBook, contractsFor, sizeUsd, FREQ };
 });
 
-// ═══ module: arb ════════════
+// ═══ module: arb ═══════════
 __def('arb', (module, exports) => {
   /**
    * Model-free arbitrage scanner.
@@ -1856,7 +1868,7 @@ __def('arb', (module, exports) => {
   module.exports = { scan, findParity, findLadder, touch, legFee };
 });
 
-// ═══ module: predict ════════════
+// ═══ module: predict ═══════════
 __def('predict', (module, exports) => {
   /**
    * Prediction ledger — the measurement instrument.
@@ -1907,7 +1919,7 @@ __def('predict', (module, exports) => {
       const saved = await store.get(KEY);
       if (saved) {
         P.settled = saved.settled || [];
-        for (const row of saved.open || []) P.open.set(row.ticker, row);
+        for (const row of saved.open || []) P.open.set(row.key || row.ticker, row);
         log.info(`predictions: ${P.settled.length} settled, ${P.open.size} awaiting`);
       }
     } catch (e) { log.debug(`prediction hydrate failed: ${e.message}`); }
@@ -1930,13 +1942,23 @@ __def('predict', (module, exports) => {
    * finds attractive. One observation per market at the same tau makes the sample
    * a clean cross-section.
    */
+  function snapshotFor(tau) {
+    for (const h of CFG.PREDICT_HORIZONS) {
+      if (tau <= h && tau > h - CFG.PREDICT_SNAP_TOLERANCE_S) return h;
+    }
+    return null;
+  }
+
   function record({ market, modelP, marketP, tau, asset, sigmaBps, z, freq }) {
     if (!Number.isFinite(modelP) || !Number.isFinite(marketP)) return;
-    if (P.open.has(market.ticker)) return;
 
-    if (tau > CFG.PREDICT_HORIZON_S || tau < CFG.PREDICT_HORIZON_S - CFG.PREDICT_BAND_S) return;
+    const horizon = snapshotFor(tau);
+    if (horizon == null) return;
+    const key = `${market.ticker}@${horizon}`;
+    if (P.open.has(key)) return;
 
-    P.open.set(market.ticker, {
+    P.open.set(key, {
+      key, horizon,
       ticker: market.ticker,
       asset,
       freq: freq || '1H',
@@ -1953,10 +1975,10 @@ __def('predict', (module, exports) => {
   }
 
   /** Score a forecast once the real outcome is known. */
-  function settle(ticker, outcomeYes) {
-    const row = P.open.get(ticker);
+  function settle(key, outcomeYes) {
+    const row = P.open.get(key);
     if (!row) return null;
-    P.open.delete(ticker);
+    P.open.delete(key);
 
     const y = outcomeYes ? 1 : 0;
     const clamp = p => Math.min(0.999, Math.max(0.001, p));
@@ -2004,6 +2026,19 @@ __def('predict', (module, exports) => {
       };
     }).filter(b => b.n > 0);
 
+    const byHorizon = {};
+    for (const r of s) {
+      const h = r.horizon || 'n/a';
+      const a = byHorizon[h] || { n: 0, model: 0, market: 0 };
+      a.n += 1; a.model += r.modelBrier; a.market += r.marketBrier;
+      byHorizon[h] = a;
+    }
+    for (const a of Object.values(byHorizon)) {
+      a.modelBrier = a.model / a.n; a.marketBrier = a.market / a.n;
+      a.edge = a.marketBrier - a.modelBrier;
+      delete a.model; delete a.market;
+    }
+
     const byAsset = {};
     for (const r of s) {
       const a = byAsset[r.asset] || { n: 0, model: 0, market: 0 };
@@ -2036,7 +2071,7 @@ __def('predict', (module, exports) => {
       edge: marketBrier - modelBrier,
       modelLog: mean(r => r.modelLog),
       marketLog: mean(r => r.marketLog),
-      buckets, byAsset,
+      buckets, byAsset, byHorizon,
       modelSharp, marketSharp, sharpRatio,
       sigmaHint: sharpRatio < 0.9
         ? `model is less confident than the market (${sharpRatio.toFixed(2)}x) — sigma looks TOO HIGH`
@@ -2067,7 +2102,7 @@ __def('predict', (module, exports) => {
   module.exports = { hydrate, record, settle, stats, persist, P };
 });
 
-// ═══ module: engine ════════════
+// ═══ module: engine ═══════════
 __def('engine', (module, exports) => {
   const CFG = __req('config');
   const log = __req('log');
@@ -2323,7 +2358,7 @@ __def('engine', (module, exports) => {
 
   // --------------------------------------------------------------- order firing
 
-  const BUILD = '2026-08-01-predict-ui';
+  const BUILD = '2026-08-01-board-fix';
 
   /**
    * Prediction tick. Prices every market the model can price, records the forecast
@@ -2344,11 +2379,11 @@ __def('engine', (module, exports) => {
       if (!o || !(o.composite > 0) || !(o.sigma > 0)) continue;
       const F = m._freq || FREQ.hourly;
       const tau = (Date.parse(m.close_time) - Date.now()) / 1000;
-      // A narrow instant around the target horizon means most markets skip the
-      // window entirely between scans. Capture anywhere in a band and let the
-      // one-row-per-ticker rule in predict.record() keep the sample clean; the
-      // recorded tau is stored so horizon can be controlled at analysis time.
-      if (tau > CFG.PREDICT_HORIZON_S || tau < CFG.PREDICT_HORIZON_S - CFG.PREDICT_BAND_S) continue;
+      // Show everything close to settlement; predict.record() decides on its own
+      // whether this tau is one of the snapshot horizons. Previously the board and
+      // the recorder shared one narrow window, so the board was empty ~97% of the
+      // time — the window only opened for two minutes an hour.
+      if (tau <= 0 || tau > CFG.PREDICT_BOARD_S) continue;
 
       const K = m._strikes || { floor: m.floor_strike, cap: m.cap_strike };
       const fv = fairValue(o, {
@@ -2364,12 +2399,13 @@ __def('engine', (module, exports) => {
       if (book.yesBid == null || book.yesAsk == null) continue;
       const marketP = (book.yesBid + book.yesAsk) / 200;
 
-      const before = predict.P.open.has(m.ticker) || predict.P.settled.some(r => r.ticker === m.ticker);
+      const openBefore = predict.P.open.size;
       predict.record({
         market: m, modelP: fv.p, marketP, tau, asset: m._asset,
         sigmaBps: fv.sigmaEffBps, z: fv.z, freq: F.label,
       });
-      if (!before && predict.P.open.has(m.ticker)) recorded += 1;
+      if (predict.P.open.size > openBefore) recorded += 1;
+      const snaps = [...predict.P.open.values()].filter(r => r.ticker === m.ticker).length;
 
       // Feed the dashboard. In predict mode the board is a comparison, not a
       // trade list: what the market thinks, what we think, and how far apart.
@@ -2387,7 +2423,8 @@ __def('engine', (module, exports) => {
         gapPP: Number(gapPP.toFixed(1)),
         agree: Math.abs(gapPP) < 3,
         lean: gapPP > 0 ? 'more likely' : 'less likely',
-        recorded: predict.P.open.has(m.ticker),
+        snaps,
+        nextSnapIn: nextSnapshotIn(tau),
         sigmaBps: fv.sigmaEffBps != null ? Number(fv.sigmaEffBps.toFixed(1)) : null,
       });
     }
@@ -2401,19 +2438,35 @@ __def('engine', (module, exports) => {
     runtime.lastScanMs = Date.now() - t0;
   }
 
+  /** Seconds until this market next hits a snapshot horizon, for the board. */
+  function nextSnapshotIn(tau) {
+    let best = null;
+    for (const h of CFG.PREDICT_HORIZONS) {
+      if (tau > h) { const d = tau - h; if (best == null || d < best) best = d; }
+    }
+    return best == null ? null : Math.round(best);
+  }
+
   /** Resolve matured forecasts using the exchange's own settlement result. */
   async function settlePredictions() {
     const now = Date.now();
-    for (const row of [...predict.P.open.values()]) {
+    const rows = [...predict.P.open.values()];
+    const resolved = new Map();
+    for (const row of rows) {
       if (Date.parse(row.closeTime) > now - 60000) continue;   // give it a minute
       try {
-        const res = await kalshi.market(row.ticker);
-        const mk = res.market || res;
+        // several snapshots share one ticker — resolve the market once
+        let mk = resolved.get(row.ticker);
+        if (!mk) {
+          const res = await kalshi.market(row.ticker);
+          mk = res.market || res;
+          resolved.set(row.ticker, mk);
+        }
         if (mk.status !== 'settled' && mk.status !== 'finalized') continue;
         const yes = String(mk.result || '').toLowerCase() === 'yes';
-        const scored = predict.settle(row.ticker, yes);
+        const scored = predict.settle(row.key || row.ticker, yes);
         if (scored) {
-          log.info(`PREDICT settled ${row.asset} ${row.ticker} -> ${yes ? 'YES' : 'NO'} `
+          log.info(`PREDICT settled ${row.asset} T-${row.horizon}s -> ${yes ? 'YES' : 'NO'} `
             + `| model ${(row.modelP * 100).toFixed(0)}% market ${(row.marketP * 100).toFixed(0)}%`);
         }
       } catch (e) { /* not resolved yet; try next pass */ }
@@ -3126,7 +3179,7 @@ __def('engine', (module, exports) => {
   module.exports = { start, runtime, setBet, setSlots, tick, discover, rejectSummary };
 });
 
-// ═══ server ══════════
+// ═══ server ═════════
 const path = require('path');
 const express = require('express');
 const CFG = __req('config');
