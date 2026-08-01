@@ -1,7 +1,10 @@
 'use strict';
 /**
  * 0XBLAQ · KALSHI ENGINE — single-file build
- * Hourly and quarter-hour crypto binaries. Search `=== module: name ===`.
+ *
+ * Two engines share this process:
+ *   ARB_MODE=false  pricing model (oracle + fair value + gates)
+ *   ARB_MODE=true   model-free arbitrage scanner
  */
 
 const __registry = {};
@@ -15,7 +18,7 @@ function __req(name) {
   return m.exports;
 }
 
-// ═══ module: config ══════════════
+// ═══ module: config ════════════════
 __def('config', (module, exports) => {
   const num = (v, d) => (v === undefined || v === '' || isNaN(Number(v)) ? d : Number(v));
   const bool = (v, d) => (v === undefined || v === '' ? d : String(v).toLowerCase() === 'true');
@@ -50,10 +53,11 @@ __def('config', (module, exports) => {
     ).split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
 
     // Quarter-hour up/down families. Same engine, different clock — see FREQ below.
-    SERIES_15M: str(
-      process.env.SERIES_15M,
-      'KXBTC15M,KXETH15M,KXSOL15M,KXXRP15M,KXDOGE15M'
-    ).split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
+    // Quarter-hour families are off by default. At a 900s horizon any error in
+    // the variance estimate dominates, and they were where the broken sigma did
+    // the most damage. Hourly only unless explicitly re-enabled.
+    SERIES_15M: str(process.env.SERIES_15M, '')
+      .split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
 
     // ---------- oracle ----------
     // Kalshi settles on CF Benchmarks Real-Time Indexes. We reconstruct the index
@@ -71,11 +75,17 @@ __def('config', (module, exports) => {
 
     // ---------- pricing ----------
     SETTLE_WINDOW_S: num(process.env.SETTLE_WINDOW_S, 60),  // Kalshi averages final 60s
-    VOL_FAST_S: num(process.env.VOL_FAST_S, 120),
-    VOL_SLOW_S: num(process.env.VOL_SLOW_S, 900),
+    VOL_FAST_S: num(process.env.VOL_FAST_S, 1800),
+    VOL_SLOW_S: num(process.env.VOL_SLOW_S, 10800),
     VOL_BLEND_FAST: num(process.env.VOL_BLEND_FAST, 0.45),
     VOL_FLOOR_BPS_PER_ROOT_S: num(process.env.VOL_FLOOR_BPS_PER_ROOT_S, 0.15),
-    ORACLE_NOISE_BPS: num(process.env.ORACLE_NOISE_BPS, 4),  // added variance floor
+    // Interval used to estimate volatility. At 1s, microstructure noise (bid-ask
+    // bounce, venue asynchrony) dominates real price movement and inflates sigma
+    // several-fold. Sampling further apart keeps the same absolute noise while the
+    // signal grows with the interval, so the bias falls proportionally.
+    VOL_SAMPLE_S: num(process.env.VOL_SAMPLE_S, 120),
+    // Per-observation microstructure noise, SUBTRACTED from realised variance.
+    ORACLE_NOISE_BPS: num(process.env.ORACLE_NOISE_BPS, 2),
     EMPIRICAL_MIN_SAMPLES: num(process.env.EMPIRICAL_MIN_SAMPLES, 240),
     EMPIRICAL_MIN_HISTORY_MULT: num(process.env.EMPIRICAL_MIN_HISTORY_MULT, 12),
     EMPIRICAL_FULL_WEIGHT_DRAWS: num(process.env.EMPIRICAL_FULL_WEIGHT_DRAWS, 40),
@@ -123,6 +133,18 @@ __def('config', (module, exports) => {
     // and should never be used with real money — it exists to answer "does the
     // order path work and is the model calibrated", not "does this make money".
     CALIBRATION_MODE: bool(process.env.CALIBRATION_MODE, false),
+
+    // ---------- arbitrage scanner ----------
+    // Model-free mode. Trades internal inconsistencies between contracts on the
+    // same event rather than a view about where price is going.
+    ARB_MODE: bool(process.env.ARB_MODE, false),
+    // Shadow mode records what it WOULD have traded and places no orders. This is
+    // how the opportunity rate gets measured before any capital is committed.
+    ARB_SHADOW: bool(process.env.ARB_SHADOW, true),
+    ARB_STAKE_USD: num(process.env.ARB_STAKE_USD, 10),
+    // Net of BOTH legs' fees. A 2c gross gap does not survive a two-legged fee.
+    ARB_MIN_NET_CENTS: num(process.env.ARB_MIN_NET_CENTS, 1.0),
+    ARB_MAX_CONCURRENT: num(process.env.ARB_MAX_CONCURRENT, 3),
 
     // When a market has no offer at all, post our own price and become the book
     // rather than skipping it. Priced at fair minus the target edge. This is how
@@ -223,7 +245,7 @@ __def('config', (module, exports) => {
   module.exports = CFG;
 });
 
-// ═══ module: log ══════════════
+// ═══ module: log ════════════════
 __def('log', (module, exports) => {
   const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
   const min = LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] || 20;
@@ -251,7 +273,7 @@ __def('log', (module, exports) => {
   };
 });
 
-// ═══ module: store ══════════════
+// ═══ module: store ════════════════
 __def('store', (module, exports) => {
   const CFG = __req('config');
 
@@ -368,7 +390,7 @@ __def('store', (module, exports) => {
   module.exports = store;
 });
 
-// ═══ module: kalshi ══════════════
+// ═══ module: kalshi ════════════════
 __def('kalshi', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -546,7 +568,7 @@ __def('kalshi', (module, exports) => {
   module.exports = kalshi;
 });
 
-// ═══ module: pricing ══════════════
+// ═══ module: pricing ════════════════
 __def('pricing', (module, exports) => {
   const CFG = __req('config');
 
@@ -611,8 +633,9 @@ __def('pricing', (module, exports) => {
 
     // --- dispersion ---
     const varMult = settleVarMultiplier(tau, W);
-    const noise = Math.pow(CFG.ORACLE_NOISE_BPS / 10000, 2);
-    const sigmaEff = Math.sqrt(o.sigma * o.sigma * varMult + noise);
+    // Noise is removed at estimation time in the oracle. Adding it back here
+    // double-counted it and inflated every tail probability.
+    const sigmaEff = Math.sqrt(o.sigma * o.sigma * varMult);
     if (!(sigmaEff > 0)) return null;
 
     const above = k => {
@@ -692,7 +715,7 @@ __def('pricing', (module, exports) => {
   module.exports = { fairValue, feeCents, Phi, settleVarMultiplier };
 });
 
-// ═══ module: oracle ══════════════
+// ═══ module: oracle ════════════════
 __def('oracle', (module, exports) => {
   const WebSocket = require('ws');
   const CFG = __req('config');
@@ -757,6 +780,8 @@ __def('oracle', (module, exports) => {
 
       this.varFast = 0;
       this.varSlow = 0;
+      this.volPrev = 0;
+      this.volPrevAt = 0;
       this.sigma = 0;                // per-sqrt(second) log-return vol
       this.sigmaBaseline = 0;        // 6h EWMA of sigma, for regime detection
       this.flow = 0;                 // signed aggressive volume EWMA, [-1,1]
@@ -810,14 +835,26 @@ __def('oracle', (module, exports) => {
         this.index = this.index + a * (comp - this.index);
       }
 
-      // Realised vol from 1s log returns, two horizons.
-      if (prev > 0) {
-        const r = Math.log(comp / prev);
-        const r2 = r * r;
-        const af = 1 - decay(HALF_LIFE_FAST, 1);
-        const as = 1 - decay(HALF_LIFE_SLOW, 1);
+      // Realised vol from log returns spaced VOL_SAMPLE_S apart, with the
+      // microstructure noise variance removed.
+      //
+      // Observed variance over an interval dt is roughly  true_var*dt + 2*noise^2.
+      // The noise term does NOT grow with dt, so at dt=1s it swamps the signal:
+      // for BTC, true variance is ~0.1bp^2/s while a 1bp quote bounce contributes
+      // ~2bp^2 — a 20x overstatement, which is a ~4.5x overstatement of sigma.
+      // That is what made every long-shot contract look mispriced.
+      if (this.volPrevAt === 0) { this.volPrev = comp; this.volPrevAt = now; }
+      const dtVol = (now - this.volPrevAt) / 1000;
+      if (this.volPrev > 0 && dtVol >= CFG.VOL_SAMPLE_S) {
+        const r = Math.log(comp / this.volPrev);
+        const noiseVar = 2 * Math.pow(CFG.ORACLE_NOISE_BPS / 10000, 2);
+        const r2 = Math.max(0, r * r - noiseVar) / dtVol;   // per-second, de-noised
+        const af = 1 - decay(HALF_LIFE_FAST, dtVol);
+        const as = 1 - decay(HALF_LIFE_SLOW, dtVol);
         this.varFast = this.varFast === 0 ? r2 : this.varFast + af * (r2 - this.varFast);
         this.varSlow = this.varSlow === 0 ? r2 : this.varSlow + as * (r2 - this.varSlow);
+        this.volPrev = comp;
+        this.volPrevAt = now;
 
         const blended = CFG.VOL_BLEND_FAST * this.varFast + (1 - CFG.VOL_BLEND_FAST) * this.varSlow;
         const floor = Math.pow(CFG.VOL_FLOOR_BPS_PER_ROOT_S / 10000, 2);
@@ -832,6 +869,7 @@ __def('oracle', (module, exports) => {
           : this.sigmaBaseline + ab * (this.sigma - this.sigmaBaseline);
         this.baselineReady = this.ringLen >= CFG.VOL_BASELINE_WARMUP_S;
       }
+      if (prev > 0) { /* 1s ring retained for the empirical bootstrap */ }
 
       this.idxRing.push(this.index);
       if (this.idxRing.length > 120) this.idxRing.shift();
@@ -1025,7 +1063,7 @@ __def('oracle', (module, exports) => {
   };
 });
 
-// ═══ module: portfolio ══════════════
+// ═══ module: portfolio ════════════════
 __def('portfolio', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -1272,7 +1310,7 @@ __def('portfolio', (module, exports) => {
   };
 });
 
-// ═══ module: strategy ══════════════
+// ═══ module: strategy ════════════════
 __def('strategy', (module, exports) => {
   const CFG = __req('config');
   const { fairValue, feeCents } = __req('pricing');
@@ -1595,7 +1633,201 @@ __def('strategy', (module, exports) => {
   module.exports = { evaluate, readBook, contractsFor, sizeUsd, FREQ };
 });
 
-// ═══ module: engine ══════════════
+// ═══ module: arb ════════════════
+__def('arb', (module, exports) => {
+  /**
+   * Model-free arbitrage scanner.
+   *
+   * Nothing here forecasts anything. Every opportunity is an internal
+   * inconsistency between contracts on the SAME event, so the profit is arithmetic
+   * rather than a probability estimate. That is the whole reason this module
+   * exists: the pricing model can be wrong about the world and these trades still
+   * settle profitably.
+   *
+   * Three families:
+   *
+   *   PARITY   Within one market, YES + NO must cost at least 100c. Buying both
+   *            for less than 100c pays exactly 100c at settlement. Riskless.
+   *
+   *   LADDER   Strikes on one event are nested: "above 117k" is true in strictly
+   *            more outcomes than "above 118k", so it must never be cheaper. When
+   *            it is, buy the cheap low strike and sell the rich high strike.
+   *
+   *   SPREAD   The same nesting bounds a strike PAIR: owning "above K1" and
+   *            shorting "above K2" (K1<K2) pays 100c if settlement lands between
+   *            them and 0c otherwise, so the pair can never cost more than 100c
+   *            nor less than 0c. Outside those bounds it is a locked profit.
+   *
+   * FEES ARE THE ADVERSARY. Kalshi charges per contract per leg, so a two-legged
+   * trade pays twice. Every candidate here is scored NET of the full round trip;
+   * gross edges that do not clear fees are discarded rather than reported.
+   */
+
+  const CFG = __req('config');
+  const { feeCents } = __req('pricing');
+  const log = __req('log');
+
+  /** Kalshi's fee schedule, applied per leg. Settlement itself is free. */
+  function legFee(count, priceCents) {
+    return feeCents(count, priceCents / 100);
+  }
+
+  /**
+   * Read one market's touch from the batch orderbook payload. Handles the legacy
+   * shape and the fixed-point shape production migrated to in July 2026.
+   */
+  function touch(entry) {
+    const b = entry?.orderbook_fp ?? entry?.orderbook ?? entry ?? {};
+    const yes = b.yes_dollars ?? b.yes ?? [];
+    const no = b.no_dollars ?? b.no ?? [];
+    const px = v => {
+      const n = Number(Array.isArray(v) ? v[0] : v);
+      if (!Number.isFinite(n)) return null;
+      return String(Array.isArray(v) ? v[0] : v).includes('.') ? n * 100 : n;
+    };
+    const sz = v => Number(Array.isArray(v) ? v[1] : 0) || 0;
+
+    const best = arr => {
+      let top = null;
+      for (const l of arr) {
+        const p = px(l);
+        if (p == null || p <= 0 || sz(l) <= 0) continue;
+        if (!top || p > top.p) top = { p, s: sz(l) };
+      }
+      return top;
+    };
+    const yb = best(yes);
+    const nb = best(no);
+    return {
+      yesBid: yb ? yb.p : null, yesBidSize: yb ? yb.s : 0,
+      noBid: nb ? nb.p : null, noBidSize: nb ? nb.s : 0,
+      // an ask on one side is the complement of the bid on the other
+      yesAsk: nb ? 100 - nb.p : null, yesAskSize: nb ? nb.s : 0,
+      noAsk: yb ? 100 - yb.p : null, noAskSize: yb ? yb.s : 0,
+    };
+  }
+
+  /**
+   * PARITY: buy YES and NO in the same market for a combined cost under 100c.
+   * The pair always pays exactly 100c, so profit = 100 - cost - fees, guaranteed.
+   */
+  function findParity(markets, books) {
+    const out = [];
+    for (const m of markets) {
+      const t = touch(books[m.ticker]);
+      if (t.yesAsk == null || t.noAsk == null) continue;
+
+      const cost = t.yesAsk + t.noAsk;
+      if (cost >= 100) continue;                       // no inconsistency
+
+      const size = Math.min(t.yesAskSize, t.noAskSize, contractsFor(m, t.yesAsk + t.noAsk));
+      if (size < 1) continue;
+
+      const fees = legFee(size, t.yesAsk) + legFee(size, t.noAsk);
+      const grossC = 100 - cost;
+      const netC = grossC - (fees / size);
+      if (netC < CFG.ARB_MIN_NET_CENTS) continue;
+
+      out.push({
+        kind: 'parity',
+        ticker: m.ticker, asset: m._asset, closeTime: m.close_time,
+        legs: [
+          { ticker: m.ticker, side: 'yes', action: 'buy', price: t.yesAsk, count: size },
+          { ticker: m.ticker, side: 'no', action: 'buy', price: t.noAsk, count: size },
+        ],
+        size, grossCents: grossC, netCents: netC,
+        profitUsd: (netC * size) / 100,
+        capitalUsd: (cost * size) / 100,
+        detail: `yes ${t.yesAsk}c + no ${t.noAsk}c = ${cost}c`,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * LADDER: within one event, a lower strike must be worth at least as much as a
+   * higher one. If we can BUY the low strike for less than we can SELL the high
+   * strike, the position is profitable in every settlement outcome.
+   *
+   * Buying YES at K1 and selling YES at K2 (K1 < K2) pays:
+   *   settle < K1        both worthless      ->  0
+   *   K1 <= settle < K2  own a winner        -> +100
+   *   settle >= K2       winner and loser    ->  0
+   * so the pair is worth 0 or +100 and can never be negative. Any net CREDIT is
+   * therefore riskless profit.
+   */
+  function findLadder(markets, books) {
+    const out = [];
+    const byEvent = {};
+    for (const m of markets) {
+      const k = `${m._series}|${m.close_time}`;
+      const strike = m.floor_strike ?? m.cap_strike;
+      if (strike == null) continue;
+      (byEvent[k] = byEvent[k] || []).push({ m, strike });
+    }
+
+    for (const [key, rungs] of Object.entries(byEvent)) {
+      if (rungs.length < 2) continue;
+      rungs.sort((a, b) => a.strike - b.strike);
+
+      for (let i = 0; i < rungs.length - 1; i++) {
+        const lo = rungs[i], hi = rungs[i + 1];
+        const tLo = touch(books[lo.m.ticker]);
+        const tHi = touch(books[hi.m.ticker]);
+        if (tLo.yesAsk == null || tHi.yesBid == null) continue;
+
+        // buy the low strike, sell the high strike
+        const credit = tHi.yesBid - tLo.yesAsk;
+        if (credit <= 0) continue;                     // normally ordered
+
+        const size = Math.min(tLo.yesAskSize, tHi.yesBidSize,
+          contractsFor(lo.m, Math.max(1, tLo.yesAsk)));
+        if (size < 1) continue;
+
+        const fees = legFee(size, tLo.yesAsk) + legFee(size, tHi.yesBid);
+        const netC = credit - (fees / size);
+        if (netC < CFG.ARB_MIN_NET_CENTS) continue;
+
+        out.push({
+          kind: 'ladder',
+          ticker: lo.m.ticker, asset: lo.m._asset, closeTime: lo.m.close_time,
+          legs: [
+            { ticker: lo.m.ticker, side: 'yes', action: 'buy', price: tLo.yesAsk, count: size },
+            { ticker: hi.m.ticker, side: 'yes', action: 'sell', price: tHi.yesBid, count: size },
+          ],
+          size, grossCents: credit, netCents: netC,
+          profitUsd: (netC * size) / 100,
+          capitalUsd: (tLo.yesAsk * size) / 100,
+          detail: `buy ${lo.strike} @${tLo.yesAsk}c, sell ${hi.strike} @${tHi.yesBid}c`,
+        });
+      }
+    }
+    return out;
+  }
+
+  /** Position size from the configured stake, capped by book depth at the touch. */
+  function contractsFor(market, priceCents) {
+    const usd = CFG.ARB_STAKE_USD;
+    return Math.max(0, Math.floor((usd * 100) / Math.max(1, priceCents)));
+  }
+
+  /**
+   * Scan every market for all opportunity types, best first.
+   * `books` is a map of ticker -> raw orderbook payload.
+   */
+  function scan(markets, books) {
+    const found = [
+      ...findParity(markets, books),
+      ...findLadder(markets, books),
+    ];
+    found.sort((a, b) => b.netCents - a.netCents);
+    return found;
+  }
+
+  module.exports = { scan, findParity, findLadder, touch, legFee };
+});
+
+// ═══ module: engine ════════════════
 __def('engine', (module, exports) => {
   const CFG = __req('config');
   const log = __req('log');
@@ -1603,6 +1835,7 @@ __def('engine', (module, exports) => {
   const oracle = __req('oracle');
   const pf = __req('portfolio');
   const { evaluate, readBook, FREQ } = __req('strategy');
+  const arb = __req('arb');
   const { feeCents, fairValue } = __req('pricing');
   const store = __req('store');
 
@@ -1849,7 +2082,134 @@ __def('engine', (module, exports) => {
 
   // --------------------------------------------------------------- order firing
 
-  const BUILD = '2026-07-30-failopen-heartbeat';
+  const BUILD = '2026-07-31-arb';
+
+  /**
+   * Arbitrage tick. Fetches WHOLE ladders (batched, 100 tickers per call) because
+   * the opportunities are relationships between strikes, not properties of a
+   * single market. Records every find to a shadow ledger; places orders only when
+   * ARB_SHADOW is off.
+   */
+  async function arbTick(t0) {
+    // discover() fills marketCache and returns nothing — read the cache.
+    await discover();
+    const markets = marketCache || [];
+    if (!markets.length) { runtime.lastScanMs = Date.now() - t0; return; }
+
+    const books = {};
+    const tickers = markets.map(m => m.ticker);
+    for (let i = 0; i < tickers.length; i += 100) {
+      try {
+        const res = await kalshi.orderbooks(tickers.slice(i, i + 100), 3);
+        for (const entry of (res.orderbooks || res.markets || [])) {
+          const t = entry.ticker || entry.market_ticker;
+          if (t) books[t] = entry;
+        }
+      } catch (e) {
+        runtime.errors += 1;
+        log.debug(`batch orderbook failed: ${e.message}`);
+      }
+    }
+    runtime.booksFetched = Object.keys(books).length;
+
+    const found = arb.scan(markets, books);
+    runtime.arbFound = found;
+    for (const opp of found) await recordShadow(opp);
+    if (!CFG.ARB_SHADOW) {
+      for (const opp of found.slice(0, CFG.ARB_MAX_CONCURRENT)) await executeArb(opp);
+    }
+    arbHeartbeat(markets, books, found);
+    runtime.lastScanAt = Date.now();
+    runtime.lastScanMs = Date.now() - t0;
+  }
+
+  /**
+   * The shadow ledger: every opportunity recorded with its computed profit and the
+   * prices behind it, traded or not. After a few hundred entries this answers the
+   * only question that matters — is the opportunity rate worth real capital.
+   */
+  async function recordShadow(opp) {
+    const key = `${opp.kind}|${opp.ticker}|${opp.closeTime}|${opp.grossCents.toFixed(1)}`;
+    runtime.shadowSeen = runtime.shadowSeen || new Set();
+    if (runtime.shadowSeen.has(key)) return;
+    runtime.shadowSeen.add(key);
+    if (runtime.shadowSeen.size > 5000) runtime.shadowSeen.clear();
+
+    const row = {
+      at: Date.now(), kind: opp.kind, asset: opp.asset, ticker: opp.ticker,
+      closeTime: opp.closeTime, size: opp.size,
+      grossCents: Number(opp.grossCents.toFixed(2)),
+      netCents: Number(opp.netCents.toFixed(2)),
+      profitUsd: Number(opp.profitUsd.toFixed(2)),
+      capitalUsd: Number(opp.capitalUsd.toFixed(2)),
+      detail: opp.detail, traded: !CFG.ARB_SHADOW,
+    };
+    runtime.shadow = runtime.shadow || [];
+    runtime.shadow.unshift(row);
+    if (runtime.shadow.length > 500) runtime.shadow.pop();
+
+    const tot = runtime.shadowTotals = runtime.shadowTotals || { n: 0, profitUsd: 0, byKind: {} };
+    tot.n += 1; tot.profitUsd += row.profitUsd;
+    const k = tot.byKind[opp.kind] || { n: 0, profitUsd: 0 };
+    k.n += 1; k.profitUsd += row.profitUsd;
+    tot.byKind[opp.kind] = k;
+
+    log.info(`ARB ${CFG.ARB_SHADOW ? '[shadow]' : '[LIVE]'} ${opp.kind} ${opp.asset} `
+      + `x${opp.size} net ${opp.netCents.toFixed(2)}¢ = $${opp.profitUsd.toFixed(2)} — ${opp.detail}`);
+    await store.set('arbShadow', runtime.shadow.slice(0, 200)).catch(() => {});
+  }
+
+  /** Both legs, or neither — a half-filled arbitrage is an unhedged position. */
+  async function executeArb(opp) {
+    if (runtime.balanceUsd != null && runtime.balanceUsd > 0
+        && opp.capitalUsd > runtime.balanceUsd - CFG.BALANCE_BUFFER_USD) return;
+    const placed = [];
+    try {
+      for (const leg of opp.legs) {
+        const res = await kalshi.createOrder({
+          ticker: leg.ticker, side: leg.side, action: leg.action,
+          count: leg.count, priceCents: leg.price, tif: 'immediate_or_cancel',
+        });
+        const o = res.order || res;
+        const filled = Number(o.fill_count ?? 0);
+        placed.push({ leg, filled });
+        if (filled < leg.count) {
+          log.warn(`ARB leg underfilled ${leg.ticker} ${filled}/${leg.count} — unwinding`);
+          return unwindArb(placed);
+        }
+      }
+      log.info(`ARB FILLED ${opp.kind} ${opp.asset} — locked $${opp.profitUsd.toFixed(2)}`);
+    } catch (e) {
+      runtime.errors += 1;
+      log.error(`ARB failed ${opp.ticker}: ${e.message} — unwinding`);
+      await unwindArb(placed);
+    }
+  }
+
+  async function unwindArb(placed) {
+    for (const p of placed) {
+      if (!p.filled) continue;
+      try {
+        await kalshi.createOrder({
+          ticker: p.leg.ticker, side: p.leg.side,
+          action: p.leg.action === 'buy' ? 'sell' : 'buy',
+          count: p.filled, priceCents: p.leg.price, tif: 'immediate_or_cancel',
+        });
+      } catch (e) { log.error(`unwind failed ${p.leg.ticker}: ${e.message}`); }
+    }
+  }
+
+  function arbHeartbeat(markets, books, found) {
+    runtime.sinceHeartbeat = (runtime.sinceHeartbeat || 0) + 1;
+    if (runtime.sinceHeartbeat < CFG.HEARTBEAT_SCANS) return;
+    runtime.sinceHeartbeat = 0;
+    const t = runtime.shadowTotals || { n: 0, profitUsd: 0, byKind: {} };
+    const kinds = Object.entries(t.byKind)
+      .map(([k, v]) => `${k} ${v.n} ($${v.profitUsd.toFixed(2)})`).join(', ') || 'none yet';
+    log.info(`arb: ${markets.length} markets, ${Object.keys(books).length} books, `
+      + `${found.length} live opportunities | cumulative: ${t.n} found, `
+      + `$${t.profitUsd.toFixed(2)} theoretical | ${kinds}`);
+  }
   const orderCooldown = new Map();
 
   async function fire(m, decision) {
@@ -2192,6 +2552,7 @@ __def('engine', (module, exports) => {
     const t0 = Date.now();
     runtime.scans += 1;
     await refreshBalance();
+    if (CFG.ARB_MODE) return arbTick(t0);
 
     if (Date.now() - lastDiscovery > 45000) await discover();
 
@@ -2397,7 +2758,7 @@ __def('engine', (module, exports) => {
   module.exports = { start, runtime, setBet, setSlots, tick, discover, rejectSummary };
 });
 
-// ═══ server ════════════
+// ═══ server ══════════════
 const path = require('path');
 const express = require('express');
 const CFG = __req('config');
@@ -2468,6 +2829,14 @@ app.get('/api/state', (req, res) => {
     rawBook: engine.runtime.rawBook,
     rawFill: engine.runtime.rawFill,
     rawBalance: engine.runtime.rawBalance,
+    arb: {
+      mode: CFG.ARB_MODE,
+      shadow: CFG.ARB_SHADOW,
+      live: engine.runtime.arbFound || [],
+      ledger: engine.runtime.shadow || [],
+      totals: engine.runtime.shadowTotals || { n: 0, profitUsd: 0, byKind: {} },
+      booksFetched: engine.runtime.booksFetched || 0,
+    },
     balanceUsd: engine.runtime.balanceUsd,
     exits: {
       takeProfitPct: CFG.TAKE_PROFIT_PCT * 100,
