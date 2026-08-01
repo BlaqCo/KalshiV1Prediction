@@ -1,9 +1,7 @@
 'use strict';
 /**
  * 0XBLAQ · KALSHI ENGINE — single-file build
- *
- * Two engines share this process:
- *   ARB_MODE=false  pricing model (oracle + fair value + gates)
+ *   ARB_MODE=false  pricing model
  *   ARB_MODE=true   model-free arbitrage scanner
  */
 
@@ -18,7 +16,7 @@ function __req(name) {
   return m.exports;
 }
 
-// ═══ module: config ════════════════
+// ═══ module: config ═══════════════
 __def('config', (module, exports) => {
   const num = (v, d) => (v === undefined || v === '' || isNaN(Number(v)) ? d : Number(v));
   const bool = (v, d) => (v === undefined || v === '' ? d : String(v).toLowerCase() === 'true');
@@ -145,6 +143,9 @@ __def('config', (module, exports) => {
     // Net of BOTH legs' fees. A 2c gross gap does not survive a two-legged fee.
     ARB_MIN_NET_CENTS: num(process.env.ARB_MIN_NET_CENTS, 1.0),
     ARB_MAX_CONCURRENT: num(process.env.ARB_MAX_CONCURRENT, 3),
+    // Tickers per batched orderbook call. Repeated as separate query params, so
+    // very large batches risk hitting URL length limits.
+    ARB_BATCH_SIZE: num(process.env.ARB_BATCH_SIZE, 40),
 
     // When a market has no offer at all, post our own price and become the book
     // rather than skipping it. Priced at fair minus the target edge. This is how
@@ -245,7 +246,7 @@ __def('config', (module, exports) => {
   module.exports = CFG;
 });
 
-// ═══ module: log ════════════════
+// ═══ module: log ═══════════════
 __def('log', (module, exports) => {
   const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
   const min = LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] || 20;
@@ -273,7 +274,7 @@ __def('log', (module, exports) => {
   };
 });
 
-// ═══ module: store ════════════════
+// ═══ module: store ═══════════════
 __def('store', (module, exports) => {
   const CFG = __req('config');
 
@@ -390,7 +391,7 @@ __def('store', (module, exports) => {
   module.exports = store;
 });
 
-// ═══ module: kalshi ════════════════
+// ═══ module: kalshi ═══════════════
 __def('kalshi', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -441,11 +442,20 @@ __def('kalshi', (module, exports) => {
   async function request(method, path, { query, body, retries = 2 } = {}) {
     await throttle();
     const fullPath = PREFIX + path;
-    const qs = query
-      ? '?' + new URLSearchParams(
-          Object.entries(query).filter(([, v]) => v !== undefined && v !== null)
-        ).toString()
-      : '';
+    // Array values must be REPEATED as separate params, not comma-joined.
+    // Kalshi validates each element of an array param independently, so
+    // `tickers=A,B,C` arrives as a single oversized Tickers[0] and 400s.
+    let qs = '';
+    if (query) {
+      const sp = new URLSearchParams();
+      for (const [k, v] of Object.entries(query)) {
+        if (v === undefined || v === null) continue;
+        if (Array.isArray(v)) v.forEach(x => sp.append(k, x));
+        else sp.append(k, v);
+      }
+      const str = sp.toString();
+      if (str) qs = '?' + str;
+    }
     const ts = Date.now().toString();
 
     const headers = {
@@ -552,9 +562,10 @@ __def('kalshi', (module, exports) => {
     },
 
     /** Batch orderbooks — up to 100 tickers in one call instead of N calls. */
+    /** Batch orderbooks. `tickers` is repeated once per market, not joined. */
     orderbooks: (tickers, depth = 5) =>
       request('GET', '/markets/orderbooks', {
-        query: { tickers: tickers.slice(0, 100).join(','), depth },
+        query: { tickers: tickers.slice(0, 100), depth },
       }),
 
     cancelOrder: id => request('DELETE', `/portfolio/events/orders/${encodeURIComponent(id)}`),
@@ -568,7 +579,7 @@ __def('kalshi', (module, exports) => {
   module.exports = kalshi;
 });
 
-// ═══ module: pricing ════════════════
+// ═══ module: pricing ═══════════════
 __def('pricing', (module, exports) => {
   const CFG = __req('config');
 
@@ -715,7 +726,7 @@ __def('pricing', (module, exports) => {
   module.exports = { fairValue, feeCents, Phi, settleVarMultiplier };
 });
 
-// ═══ module: oracle ════════════════
+// ═══ module: oracle ═══════════════
 __def('oracle', (module, exports) => {
   const WebSocket = require('ws');
   const CFG = __req('config');
@@ -1063,7 +1074,7 @@ __def('oracle', (module, exports) => {
   };
 });
 
-// ═══ module: portfolio ════════════════
+// ═══ module: portfolio ═══════════════
 __def('portfolio', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -1310,7 +1321,7 @@ __def('portfolio', (module, exports) => {
   };
 });
 
-// ═══ module: strategy ════════════════
+// ═══ module: strategy ═══════════════
 __def('strategy', (module, exports) => {
   const CFG = __req('config');
   const { fairValue, feeCents } = __req('pricing');
@@ -1633,7 +1644,7 @@ __def('strategy', (module, exports) => {
   module.exports = { evaluate, readBook, contractsFor, sizeUsd, FREQ };
 });
 
-// ═══ module: arb ════════════════
+// ═══ module: arb ═══════════════
 __def('arb', (module, exports) => {
   /**
    * Model-free arbitrage scanner.
@@ -1827,7 +1838,7 @@ __def('arb', (module, exports) => {
   module.exports = { scan, findParity, findLadder, touch, legFee };
 });
 
-// ═══ module: engine ════════════════
+// ═══ module: engine ═══════════════
 __def('engine', (module, exports) => {
   const CFG = __req('config');
   const log = __req('log');
@@ -2082,7 +2093,7 @@ __def('engine', (module, exports) => {
 
   // --------------------------------------------------------------- order firing
 
-  const BUILD = '2026-07-31-arb';
+  const BUILD = '2026-08-01-arb-batchfix';
 
   /**
    * Arbitrage tick. Fetches WHOLE ladders (batched, 100 tickers per call) because
@@ -2098,19 +2109,34 @@ __def('engine', (module, exports) => {
 
     const books = {};
     const tickers = markets.map(m => m.ticker);
-    for (let i = 0; i < tickers.length; i += 100) {
+    const CHUNK = CFG.ARB_BATCH_SIZE;
+    let batchFailed = 0;
+    for (let i = 0; i < tickers.length; i += CHUNK) {
+      const chunk = tickers.slice(i, i + CHUNK);
       try {
-        const res = await kalshi.orderbooks(tickers.slice(i, i + 100), 3);
-        for (const entry of (res.orderbooks || res.markets || [])) {
+        const res = await kalshi.orderbooks(chunk, 3);
+        const list = res.orderbooks || res.markets || [];
+        if (!runtime.rawBatch) runtime.rawBatch = JSON.stringify(res).slice(0, 400);
+        for (const entry of list) {
           const t = entry.ticker || entry.market_ticker;
           if (t) books[t] = entry;
         }
       } catch (e) {
+        batchFailed += 1;
         runtime.errors += 1;
-        log.debug(`batch orderbook failed: ${e.message}`);
+        if (batchFailed === 1) log.warn(`batch orderbook failed: ${e.message}`);
       }
     }
     runtime.booksFetched = Object.keys(books).length;
+    // A scanner with no books is blind, and that must never look like "no
+    // opportunities found". Say so loudly rather than reporting a quiet zero.
+    if (markets.length && !runtime.booksFetched) {
+      if (!runtime.blindAt || Date.now() - runtime.blindAt > 120000) {
+        runtime.blindAt = Date.now();
+        log.error(`arb is BLIND: ${markets.length} markets but 0 orderbooks fetched`
+          + ` (${batchFailed} batch call(s) failed) — not scanning`);
+      }
+    }
 
     const found = arb.scan(markets, books);
     runtime.arbFound = found;
@@ -2758,7 +2784,7 @@ __def('engine', (module, exports) => {
   module.exports = { start, runtime, setBet, setSlots, tick, discover, rejectSummary };
 });
 
-// ═══ server ══════════════
+// ═══ server ═════════════
 const path = require('path');
 const express = require('express');
 const CFG = __req('config');
