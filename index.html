@@ -432,6 +432,14 @@ async function poll(){
   setTimeout(poll, 2000);
 }
 
+/* One broken panel must never blank the whole dashboard. Each section runs in
+   isolation and reports its own failure instead of killing the render pass —
+   that is why the log panel vanished when the board threw. */
+function safe(name, fn){
+  try { fn(); }
+  catch(e){ console.error('[render] '+name+' failed:', e); }
+}
+
 function render(s){
   // header
   const m=$('modeTag'); m.textContent=s.mode; m.className='tag '+(s.mode==='LIVE'?'live':'paper');
@@ -446,21 +454,21 @@ function render(s){
     '<i class="'+cls(st.realized)+'" style="font-style:normal">'+sgn(st.realized)+' REALISED</i></span>';
   if(!dragging){ $('bet').value=s.bet.usd; $('betVal').textContent='$'+s.bet.usd; }
   $('bet').min=s.bet.min; $('bet').max=s.bet.max;
-  renderSlots(s);
+  safe('renderSlots(s)', () => renderSlots(s));
   if (pendingBet != null) showStage();
   $('pauseBtn').textContent = s.paused?'Resume':'Pause';
   $('pauseBtn').className = s.paused?'hot':'';
 
-  renderOracle(s);
-  renderBoard(s);
-  renderTVFoot(s);
-  renderPositions(s);
+  safe('renderOracle(s)', () => renderOracle(s));
+  safe('renderBoard(s)', () => renderBoard(s));
+  safe('renderTVFoot(s)', () => renderTVFoot(s));
+  safe('renderPositions(s)', () => renderPositions(s));
   renderEquity(st);
   renderAssets(st);
   renderCalib(st);
-  renderTrades(s);
-  renderRejects(s);
-  renderLogs(s);
+  safe('renderTrades(s)', () => renderTrades(s));
+  safe('renderRejects(s)', () => renderRejects(s));
+  safe('renderLogs(s)', () => renderLogs(s));
 }
 
 /* ---------- oracle rail: price, reconstructed index, and the lag that pays ---------- */
@@ -551,13 +559,14 @@ function renderPredictBoard(s){
   const mk=s.markets||[];
   const st=s.predict||{};
   $('boardNote').textContent = mk.length
-    ? mk.length+' markets near settlement · '+(st.n||0)+' scored so far'
-    : 'waiting for markets to reach the recording window';
+    ? mk.length+' near settlement · '+(st.awaiting||0)+' awaiting result · '+(st.n||0)+' scored'
+    : 'no markets within 40 minutes of settling';
 
   if(!mk.length){
-    $('mkts').innerHTML='<div class="empty"><b>NOTHING IN THE WINDOW YET</b>'+
-      'Cards appear when an hourly market is 3–5 minutes from settling. '+
-      'That happens near the top of each hour.</div>';
+    $('mkts').innerHTML='<div class="empty"><b>NO MARKETS NEAR SETTLEMENT</b>'+
+      'Cards appear for every hourly contract inside the last 40 minutes before it '+
+      'settles. If this stays empty for more than an hour, discovery is the problem, '+
+      'not the model.</div>';
     return;
   }
 
@@ -595,7 +604,8 @@ function renderPredictBoard(s){
 
       <div class="verdict ${m.agree?'':'differs'}">${verdict}</div>
       <div class="gates">
-        <span class="g ${m.recorded?'pass':'fail'}">${m.recorded?'recorded for scoring':'not recorded yet'}</span>
+        <span class="g ${m.snaps?'pass':''}">${m.snaps? m.snaps+' snapshot'+(m.snaps>1?'s':'')+' taken'
+          : (m.nextSnapIn!=null? 'next snapshot in '+clock(m.nextSnapIn) : 'no more snapshots')}</span>
         <span class="g pass">spot ${price(m.spot,m.asset)}</span>
         ${m.sigmaBps!=null?`<span class="g pass">expected move ${m.sigmaBps}bp</span>`:''}
       </div>
