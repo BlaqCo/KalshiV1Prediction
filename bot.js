@@ -1,13 +1,9 @@
 'use strict';
 /**
  * 0XBLAQ · KALSHI ENGINE — single-file build
- *
- * Three modes, selected by env:
- *   default          pricing model, trades
- *   ARB_MODE=true    model-free arbitrage scanner
- *   PREDICT_MODE=true  prediction ledger — measures the model, never trades
- *
- * Search `=== module: name ===` to jump around.
+ *   default            pricing model, trades
+ *   ARB_MODE=true      model-free arbitrage scanner
+ *   PREDICT_MODE=true  prediction ledger, never trades
  */
 
 const __registry = {};
@@ -21,7 +17,7 @@ function __req(name) {
   return m.exports;
 }
 
-// ═══ module: config ══════════════
+// ═══ module: config ═════════════
 __def('config', (module, exports) => {
   const num = (v, d) => (v === undefined || v === '' || isNaN(Number(v)) ? d : Number(v));
   const bool = (v, d) => (v === undefined || v === '' ? d : String(v).toLowerCase() === 'true');
@@ -159,6 +155,13 @@ __def('config', (module, exports) => {
     PREDICT_MODE: bool(process.env.PREDICT_MODE, false),
     PREDICT_HORIZON_S: num(process.env.PREDICT_HORIZON_S, 300),
     PREDICT_HORIZON_TOLERANCE_S: num(process.env.PREDICT_HORIZON_TOLERANCE_S, 30),
+    // Capture band below the target horizon. Wide enough that no market slips
+    // past between scans.
+    PREDICT_BAND_S: num(process.env.PREDICT_BAND_S, 120),
+    // Multiplies the volatility estimate. The prediction ledger's sharpness ratio
+    // says which way to move it: <1 means we are under-confident and sigma is too
+    // high, >1 means over-confident and sigma is too low.
+    VOL_SCALE: num(process.env.VOL_SCALE, 1.0),
     PREDICT_MIN_SAMPLE: num(process.env.PREDICT_MIN_SAMPLE, 200),
 
     // When a market has no offer at all, post our own price and become the book
@@ -260,7 +263,7 @@ __def('config', (module, exports) => {
   module.exports = CFG;
 });
 
-// ═══ module: log ══════════════
+// ═══ module: log ═════════════
 __def('log', (module, exports) => {
   const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
   const min = LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] || 20;
@@ -288,7 +291,7 @@ __def('log', (module, exports) => {
   };
 });
 
-// ═══ module: store ══════════════
+// ═══ module: store ═════════════
 __def('store', (module, exports) => {
   const CFG = __req('config');
 
@@ -405,7 +408,7 @@ __def('store', (module, exports) => {
   module.exports = store;
 });
 
-// ═══ module: kalshi ══════════════
+// ═══ module: kalshi ═════════════
 __def('kalshi', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -593,7 +596,7 @@ __def('kalshi', (module, exports) => {
   module.exports = kalshi;
 });
 
-// ═══ module: pricing ══════════════
+// ═══ module: pricing ═════════════
 __def('pricing', (module, exports) => {
   const CFG = __req('config');
 
@@ -660,7 +663,8 @@ __def('pricing', (module, exports) => {
     const varMult = settleVarMultiplier(tau, W);
     // Noise is removed at estimation time in the oracle. Adding it back here
     // double-counted it and inflated every tail probability.
-    const sigmaEff = Math.sqrt(o.sigma * o.sigma * varMult);
+    const sig = o.sigma * CFG.VOL_SCALE;
+    const sigmaEff = Math.sqrt(sig * sig * varMult);
     if (!(sigmaEff > 0)) return null;
 
     const above = k => {
@@ -740,7 +744,7 @@ __def('pricing', (module, exports) => {
   module.exports = { fairValue, feeCents, Phi, settleVarMultiplier };
 });
 
-// ═══ module: oracle ══════════════
+// ═══ module: oracle ═════════════
 __def('oracle', (module, exports) => {
   const WebSocket = require('ws');
   const CFG = __req('config');
@@ -1088,7 +1092,7 @@ __def('oracle', (module, exports) => {
   };
 });
 
-// ═══ module: portfolio ══════════════
+// ═══ module: portfolio ═════════════
 __def('portfolio', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -1335,7 +1339,7 @@ __def('portfolio', (module, exports) => {
   };
 });
 
-// ═══ module: strategy ══════════════
+// ═══ module: strategy ═════════════
 __def('strategy', (module, exports) => {
   const CFG = __req('config');
   const { fairValue, feeCents } = __req('pricing');
@@ -1658,7 +1662,7 @@ __def('strategy', (module, exports) => {
   module.exports = { evaluate, readBook, contractsFor, sizeUsd, FREQ };
 });
 
-// ═══ module: arb ══════════════
+// ═══ module: arb ═════════════
 __def('arb', (module, exports) => {
   /**
    * Model-free arbitrage scanner.
@@ -1852,7 +1856,7 @@ __def('arb', (module, exports) => {
   module.exports = { scan, findParity, findLadder, touch, legFee };
 });
 
-// ═══ module: predict ══════════════
+// ═══ module: predict ═════════════
 __def('predict', (module, exports) => {
   /**
    * Prediction ledger — the measurement instrument.
@@ -1930,8 +1934,7 @@ __def('predict', (module, exports) => {
     if (!Number.isFinite(modelP) || !Number.isFinite(marketP)) return;
     if (P.open.has(market.ticker)) return;
 
-    const target = CFG.PREDICT_HORIZON_S;
-    if (Math.abs(tau - target) > CFG.PREDICT_HORIZON_TOLERANCE_S) return;
+    if (tau > CFG.PREDICT_HORIZON_S || tau < CFG.PREDICT_HORIZON_S - CFG.PREDICT_BAND_S) return;
 
     P.open.set(market.ticker, {
       ticker: market.ticker,
@@ -2017,6 +2020,14 @@ __def('predict', (module, exports) => {
     // this is not a model.
     const climatology = mean(r => Math.pow(base - r.outcome, 2));
 
+    // Sharpness: how far from 50/50 each forecast dares to be. If the model is
+    // consistently LESS extreme than the market, sigma is too high; if MORE
+    // extreme, too low. This points straight at the variance parameter instead of
+    // leaving it to be inferred from a Brier score.
+    const modelSharp = mean(r => Math.abs(r.modelP - 0.5));
+    const marketSharp = mean(r => Math.abs(r.marketP - 0.5));
+    const sharpRatio = marketSharp > 0 ? modelSharp / marketSharp : 1;
+
     return {
       n, awaiting: P.open.size,
       ready: n >= CFG.PREDICT_MIN_SAMPLE,
@@ -2026,6 +2037,12 @@ __def('predict', (module, exports) => {
       modelLog: mean(r => r.modelLog),
       marketLog: mean(r => r.marketLog),
       buckets, byAsset,
+      modelSharp, marketSharp, sharpRatio,
+      sigmaHint: sharpRatio < 0.9
+        ? `model is less confident than the market (${sharpRatio.toFixed(2)}x) — sigma looks TOO HIGH`
+        : sharpRatio > 1.1
+          ? `model is more confident than the market (${sharpRatio.toFixed(2)}x) — sigma looks TOO LOW`
+          : `confidence matches the market (${sharpRatio.toFixed(2)}x)`,
       verdict: verdict(n, marketBrier - modelBrier, modelBrier, climatology),
     };
   }
@@ -2050,7 +2067,7 @@ __def('predict', (module, exports) => {
   module.exports = { hydrate, record, settle, stats, persist, P };
 });
 
-// ═══ module: engine ══════════════
+// ═══ module: engine ═════════════
 __def('engine', (module, exports) => {
   const CFG = __req('config');
   const log = __req('log');
@@ -2326,7 +2343,11 @@ __def('engine', (module, exports) => {
       if (!o || !(o.composite > 0) || !(o.sigma > 0)) continue;
       const F = m._freq || FREQ.hourly;
       const tau = (Date.parse(m.close_time) - Date.now()) / 1000;
-      if (Math.abs(tau - CFG.PREDICT_HORIZON_S) > CFG.PREDICT_HORIZON_TOLERANCE_S) continue;
+      // A narrow instant around the target horizon means most markets skip the
+      // window entirely between scans. Capture anywhere in a band and let the
+      // one-row-per-ticker rule in predict.record() keep the sample clean; the
+      // recorded tau is stored so horizon can be controlled at analysis time.
+      if (tau > CFG.PREDICT_HORIZON_S || tau < CFG.PREDICT_HORIZON_S - CFG.PREDICT_BAND_S) continue;
 
       const K = m._strikes || { floor: m.floor_strike, cap: m.cap_strike };
       const fv = fairValue(o, {
@@ -2385,6 +2406,7 @@ __def('engine', (module, exports) => {
     if (st.n) {
       log.info(`  model Brier ${st.modelBrier.toFixed(4)} vs market ${st.marketBrier.toFixed(4)} `
         + `(base rate ${st.climatology.toFixed(4)}) — ${st.verdict}`);
+      log.info(`  ${st.sigmaHint}`);
     }
   }
 
@@ -3079,7 +3101,7 @@ __def('engine', (module, exports) => {
   module.exports = { start, runtime, setBet, setSlots, tick, discover, rejectSummary };
 });
 
-// ═══ server ════════════
+// ═══ server ═══════════
 const path = require('path');
 const express = require('express');
 const CFG = __req('config');
