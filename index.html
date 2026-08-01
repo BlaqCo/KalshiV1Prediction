@@ -125,6 +125,27 @@ button.hot{color:var(--warn);border-color:#4A3A14}
 .mktTop{display:flex;align-items:baseline;gap:7px}
 .mktTop .sym{font-size:12px}
 .strike{color:var(--dim);font-size:11px}
+.tvwrap{height:340px;position:relative;background:#0B0D0F}
+#tvChart{position:absolute;inset:0}
+.tvpick{cursor:pointer;padding:2px 7px;margin-left:3px;border:1px solid var(--rule);
+  border-radius:2px;font-size:10px;color:var(--dim);user-select:none}
+.tvpick:hover{color:var(--ink);border-color:var(--dim)}
+.tvpick.on{color:var(--sig);border-color:var(--sig);background:#08140F}
+.tvfoot{padding:8px 12px;font-size:10px;color:var(--dim);line-height:1.6;border-top:1px solid var(--rule)}
+.tvfoot b{color:var(--ink);font-weight:500}
+.legend{grid-column:1/-1;font-size:11px;line-height:1.65;color:var(--dim);
+  padding:10px 12px;border:1px solid var(--rule);border-radius:3px;background:#0B0D0F;margin-bottom:2px}
+.legend b{color:var(--ink);font-weight:500}
+.lg{display:inline-block;width:8px;height:8px;border-radius:50%;vertical-align:middle;margin:0 2px}
+.lg.mkt{background:var(--ink)} .lg.mdl{background:var(--model)}
+.plain{display:grid;gap:5px;margin:9px 0 7px}
+.pl{display:flex;justify-content:space-between;align-items:baseline;font-size:11px}
+.pl span{color:var(--dim)}
+.pl b{font-family:var(--disp);font-size:15px;font-weight:600}
+.pl b.mktc{color:var(--ink)} .pl b.mdlc{color:var(--model)}
+.verdict{font-size:11px;line-height:1.55;color:var(--dim);margin-top:8px}
+.verdict.differs{color:var(--warn)}
+.verdict b{font-weight:600}
 .freq{font-size:8px;letter-spacing:.1em;padding:1px 4px;border-radius:2px;border:1px solid var(--rule);
   color:var(--dim);flex-shrink:0}
 .freq.m15{color:var(--model);border-color:#2E2450;background:#0F0B1A}
@@ -274,6 +295,21 @@ canvas.eq{width:100%;height:130px;display:block}
     </section>
   </div>
 
+  <section class="panel" id="tvPanel">
+    <div class="phead">
+      <h2>Chart</h2>
+      <div class="note">
+        <span class="tvpick" data-sym="COINBASE:BTCUSD" data-a="BTC">BTC</span>
+        <span class="tvpick" data-sym="COINBASE:ETHUSD" data-a="ETH">ETH</span>
+        <span class="tvpick" data-sym="COINBASE:SOLUSD" data-a="SOL">SOL</span>
+        <span class="tvpick" data-sym="COINBASE:XRPUSD" data-a="XRP">XRP</span>
+        <span class="tvpick" data-sym="COINBASE:DOGEUSD" data-a="DOGE">DOGE</span>
+      </div>
+    </div>
+    <div class="tvwrap"><div id="tvChart"></div></div>
+    <div class="tvfoot" id="tvFoot"></div>
+  </section>
+
   <section class="panel">
     <div class="phead"><h2>Why nothing fired</h2><div class="note" id="rejNote">last 60 min</div></div>
     <div class="rejlead" id="funnel"></div>
@@ -417,6 +453,7 @@ function render(s){
 
   renderOracle(s);
   renderBoard(s);
+  renderTVFoot(s);
   renderPositions(s);
   renderEquity(st);
   renderAssets(st);
@@ -458,8 +495,116 @@ function renderOracle(s){
   $('oracleNote').textContent = (s.feeds||[]).map(x=>x.venue).join(' · ');
 }
 
+/* ---------- TradingView ----------
+   Charted from COINBASE, which is one of the three venues the oracle actually
+   reconstructs its index from — so this is the same price the bot is pricing
+   against, not a different exchange that merely looks similar. */
+let tvSym='COINBASE:BTCUSD', tvAsset='BTC', tvWidget=null;
+
+function mountTV(){
+  const host=document.getElementById('tvChart');
+  if(!host) return;
+  host.innerHTML='';
+  if(!window.TradingView){ host.innerHTML='<div class="empty">Chart unavailable offline.</div>'; return; }
+  tvWidget=new window.TradingView.widget({
+    container_id:'tvChart', symbol:tvSym, interval:'5',
+    autosize:true, theme:'dark', style:'1', timezone:'Etc/UTC',
+    locale:'en', hide_side_toolbar:true, allow_symbol_change:false,
+    withdateranges:false, save_image:false,
+    backgroundColor:'#0B0D0F', gridColor:'rgba(140,150,160,0.06)',
+    studies:[], hide_volume:false,
+  });
+  document.querySelectorAll('.tvpick').forEach(el=>
+    el.classList.toggle('on', el.dataset.sym===tvSym));
+}
+
+function initTV(){
+  document.querySelectorAll('.tvpick').forEach(el=>{
+    el.addEventListener('click',()=>{ tvSym=el.dataset.sym; tvAsset=el.dataset.a; mountTV(); });
+  });
+  const sc=document.createElement('script');
+  sc.src='https://s3.tradingview.com/tv.js';
+  sc.onload=mountTV;
+  sc.onerror=()=>{ const h=document.getElementById('tvChart');
+    if(h) h.innerHTML='<div class="empty"><b>CHART BLOCKED</b>TradingView could not load.</div>'; };
+  document.head.appendChild(sc);
+}
+
+/* Tie the chart back to the oracle so it is not just decoration: show what the
+   bot currently believes about the asset on screen. */
+function renderTVFoot(s){
+  const f=document.getElementById('tvFoot'); if(!f) return;
+  const a=(s.oracle||[]).find(x=>x.asset===tvAsset);
+  if(!a){ f.innerHTML='Oracle has no reading for '+tvAsset+' yet.'; return; }
+  const venues=(s.feeds||[]).filter(x=>x.assets?.includes?.(tvAsset)).map(x=>x.venue);
+  f.innerHTML=`Bot's index for <b>${tvAsset}</b>: <b>${price(a.index,tvAsset)}</b>`
+    + ` · composite <b>${price(a.composite,tvAsset)}</b>`
+    + (a.sigmaBps!=null?` · expected move <b>${a.sigmaBps.toFixed(1)}bp/√s</b>`:'')
+    + ` · venues ${venues.length?venues.join(', '):(s.feeds||[]).map(x=>x.venue).join(', ')}`;
+}
+
 /* ---------- edge board ---------- */
+/* In predict mode the board is a COMPARISON, not a trade list. Every card says
+   the same three things in words: what the market thinks, what we think, and
+   whether that difference is big enough to care about. */
+function renderPredictBoard(s){
+  const mk=s.markets||[];
+  const st=s.predict||{};
+  $('boardNote').textContent = mk.length
+    ? mk.length+' markets near settlement · '+(st.n||0)+' scored so far'
+    : 'waiting for markets to reach the recording window';
+
+  if(!mk.length){
+    $('mkts').innerHTML='<div class="empty"><b>NOTHING IN THE WINDOW YET</b>'+
+      'Cards appear when an hourly market is 3–5 minutes from settling. '+
+      'That happens near the top of each hour.</div>';
+    return;
+  }
+
+  $('mkts').innerHTML='<div class="legend">'+
+    '<b>How to read this:</b> each card is one contract about to settle. '+
+    '<span class="lg mkt"></span> is what the market believes, '+
+    '<span class="lg mdl"></span> is what our model believes. '+
+    'We are only watching — no bets are placed. The question is whether our number '+
+    'ends up closer to what actually happens.</div>'+
+  mk.slice(0,12).map(m=>{
+    const gap=m.gapPP, big=Math.abs(gap)>=8;
+    const verdict = m.agree
+      ? 'We agree with the market. Nothing interesting here.'
+      : `We think this is <b>${Math.abs(gap).toFixed(0)} points ${m.lean}</b> than the market does.`;
+    return `<div class="mkt ${big?'fire':''}">
+      <div class="mktTop">
+        <div class="sym">${m.asset}</div>
+        <span class="freq">${m.freq}</span>
+        <div class="strike">settles ${m.direction} ${price(m.strike,m.asset)}</div>
+        <div class="clock ${m.tau<180?'soon':''}">${clock(m.tau)}</div>
+      </div>
+
+      <div class="plain">
+        <div class="pl"><span>Market says</span><b class="mktc">${m.marketPct}% chance</b></div>
+        <div class="pl"><span>Our model says</span><b class="mdlc">${m.modelPct}% chance</b></div>
+      </div>
+
+      <div class="rail">
+        <div class="railbg"></div>
+        <div class="railedge" style="left:${Math.min(m.marketPct,m.modelPct)}%;
+          width:${Math.abs(gap)}%;background:${big?'var(--warn)':'var(--dimmer)'};opacity:.45"></div>
+        <div class="mk mkt" style="left:${m.marketPct}%"></div>
+        <div class="mk mdl" style="left:${m.modelPct}%"></div>
+      </div>
+
+      <div class="verdict ${m.agree?'':'differs'}">${verdict}</div>
+      <div class="gates">
+        <span class="g ${m.recorded?'pass':'fail'}">${m.recorded?'recorded for scoring':'not recorded yet'}</span>
+        <span class="g pass">spot ${price(m.spot,m.asset)}</span>
+        ${m.sigmaBps!=null?`<span class="g pass">expected move ${m.sigmaBps}bp</span>`:''}
+      </div>
+    </div>`;
+  }).join('');
+}
+
 function renderBoard(s){
+  if(s.predictMode) return renderPredictBoard(s);
   const mk=s.markets||[];
   $('boardNote').textContent = mk.length
     ? mk.length+' live · scan '+s.lastScanMs+'ms'
@@ -766,6 +911,7 @@ function renderLogs(s){
     `<div class="${l.level}">${new Date(l.t).toLocaleTimeString([], {hour12:false})}  ${esc(l.msg)}</div>`).join('');
 }
 
+initTV();
 poll();
 window.addEventListener('resize',()=>{ if(S) render(S); });
 </script>
