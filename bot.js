@@ -1,9 +1,10 @@
 'use strict';
 /**
  * 0XBLAQ · KALSHI ENGINE — single-file build
- *   default            pricing model, trades
- *   ARB_MODE=true      arbitrage scanner
- *   PREDICT_MODE=true  prediction ledger, never trades
+ *
+ * Trading and measurement run together. The prediction ledger observes every
+ * market at fixed horizons regardless of what the gates decide, so the score
+ * measures the MODEL rather than the gates.
  */
 
 const __registry = {};
@@ -17,7 +18,7 @@ function __req(name) {
   return m.exports;
 }
 
-// ═══ module: config ═══════════
+// ═══ module: config ══════════
 __def('config', (module, exports) => {
   const num = (v, d) => (v === undefined || v === '' || isNaN(Number(v)) ? d : Number(v));
   const bool = (v, d) => (v === undefined || v === '' ? d : String(v).toLowerCase() === 'true');
@@ -152,7 +153,17 @@ __def('config', (module, exports) => {
     // Records model vs market probability at a FIXED horizon, scores both against
     // settlement. Never trades. This is how we find out whether the model knows
     // anything before any capital is committed to it.
+    // PREDICT_MODE   observe only, never trade (measurement run)
+    // PREDICT_OBSERVE record alongside normal trading, in the same process
+    //
+    // The observer deliberately runs its OWN pass over every market at a snapshot
+    // horizon, not just the ones that pass the trading gates. Scoring only the
+    // markets we chose to trade would measure the gates, not the model.
     PREDICT_MODE: bool(process.env.PREDICT_MODE, false),
+    PREDICT_OBSERVE: bool(process.env.PREDICT_OBSERVE, true),
+    // Seconds between observer passes. Independent of the trading tick so the
+    // extra orderbook reads stay a small, predictable slice of the rate limit.
+    PREDICT_OBSERVE_EVERY_S: num(process.env.PREDICT_OBSERVE_EVERY_S, 20),
     // Snapshot horizons in seconds. One row per market PER horizon, so a single
     // hourly market contributes several observations as it ages toward settlement.
     // This fixes two things at once: the sample fills far faster, and skill can be
@@ -275,7 +286,7 @@ __def('config', (module, exports) => {
   module.exports = CFG;
 });
 
-// ═══ module: log ═══════════
+// ═══ module: log ══════════
 __def('log', (module, exports) => {
   const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
   const min = LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] || 20;
@@ -303,7 +314,7 @@ __def('log', (module, exports) => {
   };
 });
 
-// ═══ module: store ═══════════
+// ═══ module: store ══════════
 __def('store', (module, exports) => {
   const CFG = __req('config');
 
@@ -420,7 +431,7 @@ __def('store', (module, exports) => {
   module.exports = store;
 });
 
-// ═══ module: kalshi ═══════════
+// ═══ module: kalshi ══════════
 __def('kalshi', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -608,7 +619,7 @@ __def('kalshi', (module, exports) => {
   module.exports = kalshi;
 });
 
-// ═══ module: pricing ═══════════
+// ═══ module: pricing ══════════
 __def('pricing', (module, exports) => {
   const CFG = __req('config');
 
@@ -756,7 +767,7 @@ __def('pricing', (module, exports) => {
   module.exports = { fairValue, feeCents, Phi, settleVarMultiplier };
 });
 
-// ═══ module: oracle ═══════════
+// ═══ module: oracle ══════════
 __def('oracle', (module, exports) => {
   const WebSocket = require('ws');
   const CFG = __req('config');
@@ -1104,7 +1115,7 @@ __def('oracle', (module, exports) => {
   };
 });
 
-// ═══ module: portfolio ═══════════
+// ═══ module: portfolio ══════════
 __def('portfolio', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -1351,7 +1362,7 @@ __def('portfolio', (module, exports) => {
   };
 });
 
-// ═══ module: strategy ═══════════
+// ═══ module: strategy ══════════
 __def('strategy', (module, exports) => {
   const CFG = __req('config');
   const { fairValue, feeCents } = __req('pricing');
@@ -1674,7 +1685,7 @@ __def('strategy', (module, exports) => {
   module.exports = { evaluate, readBook, contractsFor, sizeUsd, FREQ };
 });
 
-// ═══ module: arb ═══════════
+// ═══ module: arb ══════════
 __def('arb', (module, exports) => {
   /**
    * Model-free arbitrage scanner.
@@ -1868,7 +1879,7 @@ __def('arb', (module, exports) => {
   module.exports = { scan, findParity, findLadder, touch, legFee };
 });
 
-// ═══ module: predict ═══════════
+// ═══ module: predict ══════════
 __def('predict', (module, exports) => {
   /**
    * Prediction ledger — the measurement instrument.
@@ -2099,10 +2110,10 @@ __def('predict', (module, exports) => {
     return `model beats the market by ${(edge * 1000).toFixed(1)}/1000 Brier — worth sizing into`;
   }
 
-  module.exports = { hydrate, record, settle, stats, persist, P };
+  module.exports = { hydrate, record, settle, stats, persist, snapshotFor, P };
 });
 
-// ═══ module: engine ═══════════
+// ═══ module: engine ══════════
 __def('engine', (module, exports) => {
   const CFG = __req('config');
   const log = __req('log');
@@ -2358,7 +2369,7 @@ __def('engine', (module, exports) => {
 
   // --------------------------------------------------------------- order firing
 
-  const BUILD = '2026-08-01-board-fix';
+  const BUILD = '2026-08-01-trade-and-measure';
 
   /**
    * Prediction tick. Prices every market the model can price, records the forecast
@@ -3052,6 +3063,73 @@ __def('engine', (module, exports) => {
     }
 
     heartbeat(view);
+
+    // Measurement runs alongside trading. It reads books and writes to the
+    // prediction ledger; it never influences an entry decision.
+    if (CFG.PREDICT_OBSERVE) await observePredictions().catch(e =>
+      log.debug(`observer failed: ${e.message}`));
+  }
+
+  /**
+   * Passive observer. Snapshots model-vs-market for every hourly contract that
+   * reaches a horizon, and settles matured snapshots. Shares the trading engine's
+   * market cache and oracle, so the marginal cost is one batched orderbook call.
+   */
+  async function observePredictions() {
+    const now = Date.now();
+    if (now - (runtime.lastObserveAt || 0) < CFG.PREDICT_OBSERVE_EVERY_S * 1000) return;
+    runtime.lastObserveAt = now;
+
+    await settlePredictions();
+
+    const due = [];
+    for (const m of (marketCache || [])) {
+      const tau = (Date.parse(m.close_time) - now) / 1000;
+      if (tau <= 0) continue;
+      if (predict.snapshotFor(tau) == null) continue;
+      due.push({ m, tau });
+    }
+    if (!due.length) { runtime.observeDue = 0; return; }
+    runtime.observeDue = due.length;
+
+    // one batched call for every market that needs a snapshot this pass
+    const books = {};
+    const tickers = due.map(d => d.m.ticker);
+    for (let i = 0; i < tickers.length; i += CFG.ARB_BATCH_SIZE) {
+      try {
+        const res = await kalshi.orderbooks(tickers.slice(i, i + CFG.ARB_BATCH_SIZE), 1);
+        for (const e of (res.orderbooks || res.markets || [])) {
+          const t = e.ticker || e.market_ticker;
+          if (t) books[t] = e;
+        }
+      } catch (e) { log.debug(`observer books failed: ${e.message}`); }
+    }
+
+    let n = 0;
+    for (const { m, tau } of due) {
+      const o = oracle.get(m._asset);
+      if (!o || !(o.composite > 0) || !(o.sigma > 0)) continue;
+      const F = m._freq || FREQ.hourly;
+      const K = m._strikes || { floor: m.floor_strike, cap: m.cap_strike };
+      const fv = fairValue(o, {
+        floorStrike: K.floor, capStrike: K.cap,
+        settleWindow: F.settleWindow, tau,
+      });
+      if (!fv) continue;
+      const book = readBook(books[m.ticker]);
+      if (book.yesBid == null || book.yesAsk == null) continue;
+
+      const before = predict.P.open.size;
+      predict.record({
+        market: m, modelP: fv.p, marketP: (book.yesBid + book.yesAsk) / 200,
+        tau, asset: m._asset, sigmaBps: fv.sigmaEffBps, z: fv.z, freq: F.label,
+      });
+      if (predict.P.open.size > before) n += 1;
+    }
+    if (n) {
+      runtime.observeRecorded = (runtime.observeRecorded || 0) + n;
+      await predict.persist();
+    }
   }
 
   /**
@@ -3090,6 +3168,11 @@ __def('engine', (module, exports) => {
       + ` | bal ${runtime.balanceUsd == null ? 'n/a' : '$' + runtime.balanceUsd.toFixed(2)}`);
     log.info(`  ${bestTxt}`);
     if (fails.length) log.info(`  blocking: ${fails.join(' | ')}`);
+    if (CFG.PREDICT_OBSERVE) {
+      const ps = predict.stats();
+      log.info(`  ledger: ${ps.n} scored, ${ps.awaiting} awaiting`
+        + (ps.n ? ` | model ${ps.modelBrier.toFixed(4)} vs market ${ps.marketBrier.toFixed(4)} — ${ps.verdict}` : ''));
+    }
   }
 
   async function validateSeries() {
@@ -3179,7 +3262,7 @@ __def('engine', (module, exports) => {
   module.exports = { start, runtime, setBet, setSlots, tick, discover, rejectSummary };
 });
 
-// ═══ server ═════════
+// ═══ server ════════
 const path = require('path');
 const express = require('express');
 const CFG = __req('config');
