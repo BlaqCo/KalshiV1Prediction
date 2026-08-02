@@ -125,6 +125,21 @@ button.hot{color:var(--warn);border-color:#4A3A14}
 .mktTop{display:flex;align-items:baseline;gap:7px}
 .mktTop .sym{font-size:12px}
 .strike{color:var(--dim);font-size:11px}
+.scorelead{padding:10px 12px;font-size:11px;line-height:1.6;color:var(--dim);border-bottom:1px solid var(--rule)}
+.scorelead b{color:var(--ink);font-weight:500}
+.scorelead.good b{color:var(--sig)} .scorelead.bad b{color:var(--loss)}
+.scoregrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:1px;background:var(--rule)}
+.sc{background:var(--bg);padding:9px 11px}
+.sc span{display:block;font-size:9px;letter-spacing:.08em;color:var(--dimmer);margin-bottom:3px}
+.sc b{font-family:var(--disp);font-size:15px;font-weight:600}
+.calrows{padding:9px 12px;display:grid;gap:5px}
+.calrow{display:grid;grid-template-columns:64px 1fr 92px;gap:9px;align-items:center;font-size:10px}
+.calrow .cl{color:var(--dim)}
+.caltrack{height:6px;background:var(--rule);border-radius:3px;position:relative;overflow:hidden}
+.caltrack i{position:absolute;top:0;height:100%;border-radius:3px}
+.caltrack i.pred{background:var(--model);opacity:.55}
+.caltrack i.act{background:var(--sig);height:2px;top:2px}
+.calnum{text-align:right;font-variant-numeric:tabular-nums;color:var(--dim)}
 .tvwrap{height:340px;position:relative;background:#0B0D0F}
 #tvChart{position:absolute;inset:0}
 .tvpick{cursor:pointer;padding:2px 7px;margin-left:3px;border:1px solid var(--rule);
@@ -295,6 +310,13 @@ canvas.eq{width:100%;height:130px;display:block}
     </section>
   </div>
 
+  <section class="panel" id="scorePanel">
+    <div class="phead"><h2>Is the model any good?</h2><div class="note" id="scoreNote"></div></div>
+    <div class="scorelead" id="scoreLead"></div>
+    <div class="scoregrid" id="scoreGrid"></div>
+    <div class="calrows" id="calRows"></div>
+  </section>
+
   <section class="panel" id="tvPanel">
     <div class="phead">
       <h2>Chart</h2>
@@ -461,6 +483,7 @@ function render(s){
 
   safe('renderOracle(s)', () => renderOracle(s));
   safe('renderBoard(s)', () => renderBoard(s));
+  safe('renderScore(s)', () => renderScore(s));
   safe('renderTVFoot(s)', () => renderTVFoot(s));
   safe('renderPositions(s)', () => renderPositions(s));
   renderEquity(st);
@@ -501,6 +524,57 @@ function renderOracle(s){
   $('assets').innerHTML = rows.join('') ||
     '<div class="empty"><b>NO FEED</b>Waiting on the first venue tick.</div>';
   $('oracleNote').textContent = (s.feeds||[]).map(x=>x.venue).join(' · ');
+}
+
+/* ---------- model scorecard ----------
+   Brier score is mean squared error of a probability: lower is better. The only
+   number that matters is model vs MARKET — being well calibrated is worthless if
+   the price already knew. */
+function renderScore(s){
+  const st=s.predict||{};
+  $('scoreNote').textContent = st.n
+    ? st.n+' settled · '+(st.awaiting||0)+' pending'
+    : 'collecting';
+
+  if(!st.n){
+    $('scoreLead').innerHTML='No forecasts have settled yet. Each hourly contract is '+
+      'snapshotted four times as it counts down, then scored against what actually happened.';
+    $('scoreGrid').innerHTML=''; $('calRows').innerHTML='';
+    return;
+  }
+
+  const beat = st.edge>0;
+  $('scoreLead').className='scorelead '+(st.ready? (beat?'good':'bad') : '');
+  $('scoreLead').innerHTML = st.ready
+    ? `<b>${esc(st.verdict)}</b>`
+    : `Still collecting — <b>${st.n}</b> of the ${st.n+Math.max(0,200-st.n)} needed before this means anything. `+
+      `Early reading: model ${st.modelBrier.toFixed(4)} vs market ${st.marketBrier.toFixed(4)}.`;
+
+  const cell=(l,v,cls)=>`<div class="sc"><span>${l}</span><b class="${cls||''}">${v}</b></div>`;
+  $('scoreGrid').innerHTML =
+    cell('OUR ERROR', st.modelBrier.toFixed(4), st.edge>0?'up':'') +
+    cell('MARKET ERROR', st.marketBrier.toFixed(4)) +
+    cell('WE BEAT MARKET BY', (st.edge>=0?'+':'')+(st.edge*1000).toFixed(1), st.edge>0?'up':'down') +
+    cell('CONFIDENCE VS MKT', (st.sharpRatio||1).toFixed(2)+'x') +
+    cell('COIN-FLIP ERROR', st.climatology.toFixed(4));
+
+  const rows=(st.buckets||[]).map(b=>{
+    const off=Math.abs(b.predicted-b.actual)*100;
+    return `<div class="calrow">
+      <div class="cl">${b.range}</div>
+      <div class="caltrack">
+        <i class="pred" style="left:0;width:${b.predicted*100}%"></i>
+        <i class="act" style="left:0;width:${b.actual*100}%"></i>
+      </div>
+      <div class="calnum">${(b.actual*100).toFixed(0)}% real · n=${b.n}
+        <span class="${off>12?'down':'mut'}">${off>12?'off':'ok'}</span></div>
+    </div>`;
+  }).join('');
+  $('calRows').innerHTML = rows
+    ? '<div class="mut" style="font-size:10px;margin-bottom:3px">'+
+      'violet = what we predicted, green line = what actually happened. '+
+      'They should line up.</div>'+rows
+    : '';
 }
 
 /* ---------- TradingView ----------
