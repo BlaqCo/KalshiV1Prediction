@@ -133,6 +133,10 @@ button.hot{color:var(--warn);border-color:#4A3A14}
 .sc span{display:block;font-size:9px;letter-spacing:.08em;color:var(--dimmer);margin-bottom:3px}
 .sc b{font-family:var(--disp);font-size:15px;font-weight:600}
 .calrows{padding:9px 12px;display:grid;gap:5px}
+.tune{font-size:10px;line-height:1.6;color:var(--dim);padding:8px 10px;
+  border:1px solid var(--rule);border-radius:3px;background:#0B0D0F}
+.tune.ok{border-color:#1E4A38;background:#08140F;color:var(--sig)}
+.tune b{color:var(--ink);font-weight:500}
 .calrow{display:grid;grid-template-columns:64px 1fr 92px;gap:9px;align-items:center;font-size:10px}
 .calrow .cl{color:var(--dim)}
 .caltrack{height:6px;background:var(--rule);border-radius:3px;position:relative;overflow:hidden}
@@ -558,6 +562,14 @@ function renderScore(s){
     cell('CONFIDENCE VS MKT', (st.sharpRatio||1).toFixed(2)+'x') +
     cell('COIN-FLIP ERROR', st.climatology.toFixed(4));
 
+  const at=s.autotune||{};
+  const tune = at.ready
+    ? `<div class="tune ${at.validated?'ok':''}">
+         <b>Self-check:</b> ${esc(at.note)}
+         ${at.validated?`<div class="mut" style="margin-top:4px">Set <b>VOL_SCALE=${at.recommended}</b> to apply. Verified on data the fit never saw.</div>`:''}
+       </div>`
+    : `<div class="tune"><b>Self-check:</b> ${esc(at.note||'collecting')}</div>`;
+
   const rows=(st.buckets||[]).map(b=>{
     const off=Math.abs(b.predicted-b.actual)*100;
     return `<div class="calrow">
@@ -570,11 +582,11 @@ function renderScore(s){
         <span class="${off>12?'down':'mut'}">${off>12?'off':'ok'}</span></div>
     </div>`;
   }).join('');
-  $('calRows').innerHTML = rows
-    ? '<div class="mut" style="font-size:10px;margin-bottom:3px">'+
+  $('calRows').innerHTML = tune + (rows
+    ? '<div class="mut" style="font-size:10px;margin:8px 0 3px">'+
       'violet = what we predicted, green line = what actually happened. '+
       'They should line up.</div>'+rows
-    : '';
+    : '');
 }
 
 /* ---------- TradingView ----------
