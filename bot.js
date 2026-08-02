@@ -1,10 +1,7 @@
 'use strict';
 /**
  * 0XBLAQ · KALSHI ENGINE — single-file build
- *
- * Trading and measurement run together. The prediction ledger observes every
- * market at fixed horizons regardless of what the gates decide, so the score
- * measures the MODEL rather than the gates.
+ * Trades, measures itself, and refits its volatility scale out-of-sample.
  */
 
 const __registry = {};
@@ -18,7 +15,7 @@ function __req(name) {
   return m.exports;
 }
 
-// ═══ module: config ══════════
+// ═══ module: config ════════
 __def('config', (module, exports) => {
   const num = (v, d) => (v === undefined || v === '' || isNaN(Number(v)) ? d : Number(v));
   const bool = (v, d) => (v === undefined || v === '' ? d : String(v).toLowerCase() === 'true');
@@ -187,6 +184,16 @@ __def('config', (module, exports) => {
     VOL_SCALE: num(process.env.VOL_SCALE, 1.0),
     PREDICT_MIN_SAMPLE: num(process.env.PREDICT_MIN_SAMPLE, 200),
 
+    // ---------- learning loop ----------
+    // Refits the volatility scale against settled outcomes and publishes a
+    // recommendation. It never applies itself; VOL_SCALE stays a human decision.
+    AUTOTUNE_MIN_SAMPLE: num(process.env.AUTOTUNE_MIN_SAMPLE, 150),
+    // Hard bound on the fitted multiplier, both directions (k in [1/C, C]).
+    AUTOTUNE_CLAMP: num(process.env.AUTOTUNE_CLAMP, 2.0),
+    // Minimum out-of-sample log-loss improvement, in percent, before a change is
+    // recommended. Without this, a marginal fit on noisy data always "wins".
+    AUTOTUNE_MIN_GAIN_PCT: num(process.env.AUTOTUNE_MIN_GAIN_PCT, 3.0),
+
     // When a market has no offer at all, post our own price and become the book
     // rather than skipping it. Priced at fair minus the target edge. This is how
     // you actually trade thin books — but see the paper-fill caveat in the README.
@@ -286,7 +293,7 @@ __def('config', (module, exports) => {
   module.exports = CFG;
 });
 
-// ═══ module: log ══════════
+// ═══ module: log ════════
 __def('log', (module, exports) => {
   const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
   const min = LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] || 20;
@@ -314,7 +321,7 @@ __def('log', (module, exports) => {
   };
 });
 
-// ═══ module: store ══════════
+// ═══ module: store ════════
 __def('store', (module, exports) => {
   const CFG = __req('config');
 
@@ -431,7 +438,7 @@ __def('store', (module, exports) => {
   module.exports = store;
 });
 
-// ═══ module: kalshi ══════════
+// ═══ module: kalshi ════════
 __def('kalshi', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -619,7 +626,7 @@ __def('kalshi', (module, exports) => {
   module.exports = kalshi;
 });
 
-// ═══ module: pricing ══════════
+// ═══ module: pricing ════════
 __def('pricing', (module, exports) => {
   const CFG = __req('config');
 
@@ -767,7 +774,7 @@ __def('pricing', (module, exports) => {
   module.exports = { fairValue, feeCents, Phi, settleVarMultiplier };
 });
 
-// ═══ module: oracle ══════════
+// ═══ module: oracle ════════
 __def('oracle', (module, exports) => {
   const WebSocket = require('ws');
   const CFG = __req('config');
@@ -1115,7 +1122,7 @@ __def('oracle', (module, exports) => {
   };
 });
 
-// ═══ module: portfolio ══════════
+// ═══ module: portfolio ════════
 __def('portfolio', (module, exports) => {
   const crypto = require('crypto');
   const CFG = __req('config');
@@ -1362,7 +1369,7 @@ __def('portfolio', (module, exports) => {
   };
 });
 
-// ═══ module: strategy ══════════
+// ═══ module: strategy ════════
 __def('strategy', (module, exports) => {
   const CFG = __req('config');
   const { fairValue, feeCents } = __req('pricing');
@@ -1685,7 +1692,7 @@ __def('strategy', (module, exports) => {
   module.exports = { evaluate, readBook, contractsFor, sizeUsd, FREQ };
 });
 
-// ═══ module: arb ══════════
+// ═══ module: arb ════════
 __def('arb', (module, exports) => {
   /**
    * Model-free arbitrage scanner.
@@ -1879,7 +1886,7 @@ __def('arb', (module, exports) => {
   module.exports = { scan, findParity, findLadder, touch, legFee };
 });
 
-// ═══ module: predict ══════════
+// ═══ module: predict ════════
 __def('predict', (module, exports) => {
   /**
    * Prediction ledger — the measurement instrument.
@@ -2110,10 +2117,112 @@ __def('predict', (module, exports) => {
     return `model beats the market by ${(edge * 1000).toFixed(1)}/1000 Brier — worth sizing into`;
   }
 
-  module.exports = { hydrate, record, settle, stats, persist, snapshotFor, P };
+  /**
+   * ---------------------------------------------------------------------------
+   * Learning loop.
+   * ---------------------------------------------------------------------------
+   *
+   * The model's only serious failure mode has been a mis-scaled volatility, and
+   * that is a ONE parameter problem. Fitting one parameter to a few hundred
+   * outcomes is defensible; fitting twenty would just be overfitting with extra
+   * steps, and overfitting to noise is how this project lost money the first time.
+   *
+   * The refit is exact rather than approximate. Every stored forecast keeps its
+   * z-score, and scaling sigma by k maps precisely to z -> z/k, so each past
+   * forecast can be re-scored under a hypothetical sigma without re-running the
+   * oracle. Grid search k, score by log loss, keep the winner.
+   *
+   * Three guards, all of which exist because of specific past mistakes:
+   *
+   *   HOLDOUT   Fit on the older 70%, score on the newer 30%. A k that only helps
+   *             in-sample is noise. If it fails out-of-sample we keep k=1.
+   *   SAMPLE    Nothing is proposed below AUTOTUNE_MIN_SAMPLE outcomes.
+   *   CLAMP     k is bounded. Even a genuine fit cannot move sigma more than the
+   *             clamp allows in one step, so a bad window cannot wreck the model.
+   *
+   * Nothing here applies itself. It publishes a recommendation; a human sets
+   * VOL_SCALE. That is deliberate — an unattended loop that both fits and trades
+   * on its own fit is the single most dangerous thing this codebase could contain.
+   */
+  const erf = x => {
+    const t = 1 / (1 + 0.3275911 * Math.abs(x));
+    const y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t
+      - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
+    return x >= 0 ? y : -y;
+  };
+  const Phi = z => 0.5 * (1 + erf(z / Math.SQRT2));
+
+  /** Re-score one stored forecast as if sigma had been scaled by k. */
+  function pUnderScale(row, k) {
+    if (row.z == null || !Number.isFinite(row.z)) return null;
+    // z was computed with the recorded sigma; scaling sigma by k scales z by 1/k
+    const p = 1 - Phi(row.z / k);
+    return Math.min(0.999, Math.max(0.001, p));
+  }
+
+  function logLoss(rows, k) {
+    let sum = 0, n = 0;
+    for (const r of rows) {
+      const p = pUnderScale(r, k);
+      if (p == null) continue;
+      sum += -Math.log(r.outcome ? p : 1 - p);
+      n += 1;
+    }
+    return n ? { loss: sum / n, n } : null;
+  }
+
+  function fitVolScale() {
+    const usable = P.settled.filter(r => r.z != null && Number.isFinite(r.z));
+    const n = usable.length;
+    if (n < CFG.AUTOTUNE_MIN_SAMPLE) {
+      return { ready: false, n, need: CFG.AUTOTUNE_MIN_SAMPLE,
+        note: `need ${CFG.AUTOTUNE_MIN_SAMPLE} scored forecasts with a z-score, have ${n}` };
+    }
+
+    // chronological split: oldest first (P.settled is newest-first)
+    const chron = [...usable].reverse();
+    const cut = Math.floor(chron.length * 0.7);
+    const train = chron.slice(0, cut);
+    const test = chron.slice(cut);
+
+    const lo = 1 / CFG.AUTOTUNE_CLAMP, hi = CFG.AUTOTUNE_CLAMP;
+    let best = null;
+    for (let k = lo; k <= hi + 1e-9; k += 0.02) {
+      const r = logLoss(train, k);
+      if (r && (!best || r.loss < best.loss)) best = { k: Number(k.toFixed(2)), loss: r.loss };
+    }
+    if (!best) return { ready: false, n, note: 'no usable rows' };
+
+    const testBest = logLoss(test, best.k);
+    const testOne = logLoss(test, 1.0);
+    if (!testBest || !testOne) return { ready: false, n, note: 'holdout too small' };
+
+    // A bare "better than baseline" test is too weak: with a few hundred noisy
+    // outcomes some k almost always edges ahead by a hair. Require the
+    // out-of-sample gain to be MATERIAL before recommending a change.
+    const gainPct = (testOne.loss - testBest.loss) / testOne.loss * 100;
+    const improves = gainPct >= CFG.AUTOTUNE_MIN_GAIN_PCT;
+    return {
+      ready: true, n,
+      recommended: improves ? best.k : 1.0,
+      fittedK: best.k,
+      trainLoss: best.loss,
+      holdoutLoss: testBest.loss,
+      holdoutBaseline: testOne.loss,
+      holdoutGain: testOne.loss - testBest.loss,
+      validated: improves,
+      gainPct: Number(gainPct.toFixed(2)),
+      note: improves
+        ? `VOL_SCALE=${best.k} improves out-of-sample log loss by ${gainPct.toFixed(1)}% — safe to apply`
+        : `best fit (${best.k}) gains only ${gainPct.toFixed(1)}% out of sample, `
+          + `below the ${CFG.AUTOTUNE_MIN_GAIN_PCT}% bar — keep VOL_SCALE=1.0`,
+    };
+  }
+
+  module.exports = { hydrate, record, settle, stats, persist, snapshotFor, fitVolScale, P };
 });
 
-// ═══ module: engine ══════════
+// ═══ module: engine ════════
 __def('engine', (module, exports) => {
   const CFG = __req('config');
   const log = __req('log');
@@ -2369,7 +2478,7 @@ __def('engine', (module, exports) => {
 
   // --------------------------------------------------------------- order firing
 
-  const BUILD = '2026-08-01-trade-and-measure';
+  const BUILD = '2026-08-01-selftune';
 
   /**
    * Prediction tick. Prices every market the model can price, records the forecast
@@ -3170,6 +3279,8 @@ __def('engine', (module, exports) => {
     if (fails.length) log.info(`  blocking: ${fails.join(' | ')}`);
     if (CFG.PREDICT_OBSERVE) {
       const ps = predict.stats();
+      const at = predict.fitVolScale();
+      if (at.ready && at.validated) log.info(`  AUTOTUNE: ${at.note}`);
       log.info(`  ledger: ${ps.n} scored, ${ps.awaiting} awaiting`
         + (ps.n ? ` | model ${ps.modelBrier.toFixed(4)} vs market ${ps.marketBrier.toFixed(4)} — ${ps.verdict}` : ''));
     }
@@ -3262,7 +3373,7 @@ __def('engine', (module, exports) => {
   module.exports = { start, runtime, setBet, setSlots, tick, discover, rejectSummary };
 });
 
-// ═══ server ════════
+// ═══ server ══════
 const path = require('path');
 const express = require('express');
 const CFG = __req('config');
@@ -3335,6 +3446,7 @@ app.get('/api/state', (req, res) => {
     rawFill: engine.runtime.rawFill,
     rawBalance: engine.runtime.rawBalance,
     predict: predict.stats(),
+    autotune: predict.fitVolScale(),
     predictMode: !!engine.runtime.predictMode,
     arb: {
       mode: CFG.ARB_MODE,
